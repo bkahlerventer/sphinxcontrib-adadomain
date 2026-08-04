@@ -34,7 +34,20 @@ from sphinx.locale import _, __
 from sphinx.roles import XRefRole
 from sphinx.util.docfields import Field, TypedField
 from sphinx.util.nodes import make_refnode, make_id
+from sphinx.util.typing import ExtensionMetadata
 
+
+# ---------------------------------------------------------------------------
+# Sphinx 9 / docutils 0.21+ compatibility patch
+# ---------------------------------------------------------------------------
+# Sphinx 9 / docutils 0.21+ requires ``desc_name(rawsource, text, *children)``;
+# the older ``desc_name(text, *children)`` form puts the display text into the
+# rawsource slot and leaves the visible name empty. Each ``addnodes.desc_*``
+# call in this file uses the keyword ``text=`` form so the rawsource defaults
+# to the empty string. See specs/03-directives-roles/01-addnodes-desc-nodes.md
+# for the full addnodes hierarchy and specs/05-from-08-to-09-migration/
+# 01-sphinx-9-breaking-changes.md for the migration story.
+# ---------------------------------------------------------------------------
 try:
     import libadalang as lal
 
@@ -175,6 +188,17 @@ class AdaObject(ObjectDescription):
 
     def handle_subp_sig(self, sig: str, signode: desc_signature) -> str:
 
+        # libadalang's subp_spec_rule requires a leading 'procedure'/'function'
+        # keyword in the input buffer. The Sphinx directive name already encodes
+        # the objtype, so the natural keyword-less form
+        #     .. ada:procedure:: Pump_Bytes (Fd : Integer)
+        # would otherwise fail with `Expected 'function', got Identifier`.
+        # Prepend the keyword when it's missing, using self.objtype to know
+        # which one to inject.
+        m = ada_subp_sig_re.match(sig)
+        if m is None:
+            sig = f"{self.objtype} {sig}"
+
         subp_spec_unit = lal_context.get_from_buffer(
             "<input>", sig, rule=lal.GrammarRule.subp_spec_rule
         )
@@ -194,8 +218,8 @@ class AdaObject(ObjectDescription):
         )
 
         kind = "function " if is_func else "procedure "
-        signode += addnodes.desc_annotation(kind, kind)
-        signode += addnodes.desc_name(signode, subp_name)
+        signode += addnodes.desc_annotation(text=kind)
+        signode += addnodes.desc_name(text=subp_name)
 
         signode += nodes.Text(" ")
 
@@ -224,60 +248,299 @@ class AdaObject(ObjectDescription):
         return subp_name
 
     def handle_type_sig(self, sig: str, signode: desc_signature) -> str:
-        m = ada_type_sig_re.match(sig)
-        if m is None:
-            raise Exception(f"m did not match for sig {sig}")
+        """
+        Parse an Ada type declaration.
 
-        name = m.groups()[0]
+        libadalang is tried first; the regex ``ada_type_sig_re`` is the
+        fallback. The consumer's signature does not include the ``type``
+        keyword (the directive name carries it), so we prepend it before
+        asking libadalang to parse, mirroring the pattern used by
+        ``handle_subp_sig``.
+        """
+        name: Union[str, None] = None
 
-        signode += addnodes.desc_annotation("type ", "type ")
-        signode += addnodes.desc_name(signode, name)
-        signode += addnodes.desc_type(name, "")
+        # libadalang-first.
+        if USE_LAL:
+            try:
+                # libadalang's type_decl_rule needs a complete type
+                # declaration. The consumer's sig is just the bare name
+                # (e.g. ``Color_T``), so we synthesise an Ada 2022
+                # incomplete type declaration ``type <name>;`` and parse
+                # that. Returns ``IncompleteTypeDecl`` whose ``f_name``
+                # carries the identifier.
+                prefixed = sig if sig.lstrip().startswith("type ") else f"type {sig};"
+                # Use a unique buffer name per call to avoid state leak
+                # across invocations of handle_signature in the same build.
+                unit = lal_context.get_from_buffer(
+                    f"<ada_type_{id(self)}>", prefixed, rule=lal.GrammarRule.type_decl_rule
+                )
+                root = unit.root
+                if root is not None and not unit.diagnostics and root.f_name:
+                    name = root.f_name.text
+            except Exception:
+                name = None
+
+        # Regex fallback.
+        if name is None:
+            m = ada_type_sig_re.match(sig)
+            if m is None:
+                raise Exception(f"m did not match for sig {sig}")
+            name = m.groups()[0]
+
+        signode += addnodes.desc_annotation(text="type ")
+        signode += addnodes.desc_name(text=name)
+        # desc_type intentionally omitted: it produces
+        # "unknown node type" warnings against Sphinx 9
+        # without changing the cross-link ID or text.
 
         return name
 
     def handle_object_sig(self, sig: str, signode: desc_signature) -> str:
-        m = ada_object_sig_re.match(sig)
-        if m is None:
-            raise Exception(f"m did not match for sig {sig}")
+        """
+        Parse an Ada object declaration (variable or constant).
 
-        name, descr = m.groups()
+        libadalang is tried first; the regex ``ada_object_sig_re`` is the
+        fallback. libadalang needs the declaration wrapped in a package
+        spec to parse it standalone.
+        """
+        name: Union[str, None] = None
+        descr: Union[str, None] = None
+
+        # libadalang-first: wrap the bare decl in a package spec and
+        # parse with package_decl_rule. We then walk into the public
+        # part to find the first ObjectDecl.
+        if USE_LAL:
+            try:
+                wrapped = f"package Wrap is {sig}; end Wrap;"
+                # Use a unique buffer name per call to avoid libadalang
+                # caching state across invocations.
+                unit = lal_context.get_from_buffer(
+                    f"<ada_obj_{id(self)}>", wrapped, rule=lal.GrammarRule.package_decl_rule
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if isinstance(decl, lal.ObjectDecl) and decl.f_ids:
+                        name = decl.f_ids[0].text
+                        # Rebuild the type annotation: `` : T [:= default]``.
+                        type_text = (
+                            decl.f_type_expr.text
+                            if decl.f_type_expr is not None
+                            else ""
+                        )
+                        default_text = (
+                            decl.f_default_expr.text
+                            if decl.f_default_expr is not None
+                            else ""
+                        )
+                        if default_text:
+                            descr = f": {type_text} := {default_text}"
+                        else:
+                            descr = f": {type_text}"
+            except Exception:
+                name = None
+                descr = None
+
+        # Regex fallback.
+        if name is None:
+            m = ada_object_sig_re.match(sig)
+            if m is None:
+                raise Exception(f"could not parse object sig {sig!r}")
+            name, descr = m.groups()
+
+        assert descr is not None
         descr = " " + descr
 
-        signode += addnodes.desc_name(signode, name)
-        signode += addnodes.desc_annotation(descr, descr)
-        signode += addnodes.desc_type(name, "")
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_annotation(text=descr)
+        # desc_type intentionally omitted: it produces
+        # "unknown node type" warnings against Sphinx 9
+        # without changing the cross-link ID or text.
 
         return name
 
     def handle_gen_package_sig(self, sig: str, signode: desc_signature) -> str:
-        signode += addnodes.desc_annotation(
-            "generic package ", "generic package "
-        )
-        signode += addnodes.desc_name(signode, sig)
-        return sig
+        """
+        Parse a generic package declaration.
+
+        libadalang is tried first; the raw ``sig`` is the fallback when
+        libadalang cannot parse it.
+        """
+        name: Union[str, None] = None
+
+        # libadalang-first: wrap in a package spec so the generic decl
+        # is a recognisable inner declaration.
+        if USE_LAL:
+            try:
+                wrapped = f"package Wrap is {sig}; end Wrap;"
+                # Use a unique buffer name per call to avoid libadalang
+                # caching state across invocations.
+                unit = lal_context.get_from_buffer(
+                    f"<ada_genpkg_{id(self)}>",
+                    wrapped,
+                    rule=lal.GrammarRule.package_decl_rule,
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if (
+                        isinstance(decl, lal.GenericPackageDecl)
+                        and decl.f_package_decl is not None
+                        and decl.f_package_decl.f_package_name
+                    ):
+                        name = decl.f_package_decl.f_package_name.text
+            except Exception:
+                name = None
+
+        if name is None:
+            name = sig
+
+        signode += addnodes.desc_annotation(text="generic package ")
+        signode += addnodes.desc_name(text=name)
+        return name
 
     def handle_package_sig(self, sig: str, signode: desc_signature) -> str:
-        signode += addnodes.desc_annotation("package ", "package ")
-        signode += addnodes.desc_name(signode, sig)
-        return sig
+        """
+        Parse a package declaration.
+
+        libadalang is tried first; the raw ``sig`` is the fallback.
+        """
+        name: Union[str, None] = None
+
+        # libadalang-first.
+        if USE_LAL:
+            try:
+                wrapped = f"package Wrap is package {sig} is end {sig}; end Wrap;"
+                unit = lal_context.get_from_buffer(
+                    f"<ada_pkg_{id(self)}>",
+                    wrapped,
+                    rule=lal.GrammarRule.package_decl_rule,
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if (
+                        isinstance(decl, lal.PackageDecl)
+                        and decl.f_package_name
+                    ):
+                        name = decl.f_package_name.text
+            except Exception:
+                name = None
+
+        if name is None:
+            name = sig
+
+        signode += addnodes.desc_annotation(text="package ")
+        signode += addnodes.desc_name(text=name)
+        return name
 
     def handle_exception_sig(self, sig: str, signode: desc_signature) -> str:
-        signode += addnodes.desc_name(signode, sig)
-        signode += addnodes.desc_annotation(": exception", ": exception")
-        return sig
+        """
+        Parse an exception declaration.
+
+        libadalang is tried first; the raw ``sig`` is the fallback.
+        """
+        name: Union[str, None] = None
+
+        # libadalang-first: wrap in a package spec so the exception
+        # decl is a recognisable inner declaration. The ``: exception``
+        # marker is appended if the consumer's sig omitted it.
+        if USE_LAL:
+            try:
+                tail = "" if sig.rstrip().endswith(": exception") else ": exception"
+                wrapped = f"package Wrap is {sig}{tail}; end Wrap;"
+                unit = lal_context.get_from_buffer(
+                    f"<ada_exc_{id(self)}>",
+                    wrapped,
+                    rule=lal.GrammarRule.package_decl_rule,
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if isinstance(decl, lal.ExceptionDecl) and decl.f_ids:
+                        name = decl.f_ids[0].text
+            except Exception:
+                name = None
+
+        if name is None:
+            name = sig
+
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_annotation(text=": exception")
+        return name
 
     def handle_package_inst(self, sig: str, signode: desc_signature) -> str:
-        m = ada_package_inst_sig_re.match(sig)
-        if m is None:
-            raise Exception(f"m did not match for sig {sig}")
-        name, inst = m.groups()
+        """
+        Parse a generic package instantiation.
 
-        signode += addnodes.desc_annotation("package ", "package ")
-        signode += addnodes.desc_name(signode, name)
-        signode += addnodes.desc_name(" ", " ")
-        signode += addnodes.desc_annotation(" is new ", " is new ")
-        signode += addnodes.desc_name(inst, inst)
+        libadalang is tried first; the regex ``ada_package_inst_sig_re`` is
+        the fallback.
+        """
+        name: Union[str, None] = None
+        inst: Union[str, None] = None
+
+        # libadalang-first.
+        if USE_LAL:
+            try:
+                wrapped = f"package Wrap is {sig}; end Wrap;"
+                # Use a unique buffer name per call to avoid libadalang
+                # caching state across invocations.
+                unit = lal_context.get_from_buffer(
+                    f"<ada_inst_{id(self)}>",
+                    wrapped,
+                    rule=lal.GrammarRule.package_decl_rule,
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if (
+                        isinstance(decl, lal.GenericPackageInstantiation)
+                        and decl.f_name
+                        and decl.f_generic_pkg_name
+                    ):
+                        name = decl.f_name.text
+                        inst = decl.f_generic_pkg_name.text
+            except Exception:
+                name = None
+                inst = None
+
+        # Regex fallback.
+        if name is None:
+            m = ada_package_inst_sig_re.match(sig)
+            if m is None:
+                raise Exception(f"m did not match for sig {sig}")
+            name, inst = m.groups()
+
+        signode += addnodes.desc_annotation(text="package ")
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_name(text=" ")
+        signode += addnodes.desc_annotation(text=" is new ")
+        signode += addnodes.desc_name(text=inst)
 
         return name
 
@@ -310,6 +573,37 @@ class AdaObject(ObjectDescription):
             return f"{name} (Ada type)"
         else:
             return ""
+
+    def _object_hierarchy_parts(
+        self, sig_node: desc_signature
+    ) -> Tuple[str, ...]:
+        """
+        Return the breadcrumb path for cross-reference rendering.
+
+        Sphinx 9 introduced ``_object_hierarchy_parts`` so that a directive
+        can tell Sphinx how its display name should be broken up into a
+        hierarchy (e.g. ``Ada.Foo.Bar`` instead of just ``Bar``). The
+        returned tuple is the breadcrumb's prefix segments; the leaf name
+        is appended by Sphinx from the directive's resolved name.
+
+        For the Ada domain we split the resolved name on ``.`` and return
+        everything except the leaf. Nested generics are not handled.
+        """
+        # The signature line carries the full Ada dotted name
+        # (e.g. "My_Package.My_Procedure"). Split on the last '.' to
+        # produce the hierarchy prefix. If there is no dot the object is
+        # top-level and there is no breadcrumb.
+        full = sig_node.get("_toc_parts_name") or ""
+        if not full:
+            # Fall back to the textual content of the first desc_name child.
+            for child in sig_node.children:
+                if isinstance(child, addnodes.desc_name):
+                    full = child.astext()
+                    break
+        parts = full.split(".")
+        if len(parts) <= 1:
+            return ()
+        return tuple(parts[:-1])
 
     def add_target_and_index(
         self, name: str, sig: str, signode: desc_signature
@@ -519,6 +813,13 @@ class AdaDomain(Domain):
 
     name = "ada"
     label = "Ada"
+
+    # Bump when ``initial_data`` schema changes. The schema gains the
+    # ``packages`` key in 1.0.fork1 because ``AdaPackageIndex`` is now
+    # actively used (it was defined before but never populated by any
+    # consumer on the upstream master branch).
+    data_version = 2
+
     object_types = {
         "function": ObjType(_("function"), "func"),
         "procedure": ObjType(_("procedure"), "proc"),
@@ -650,6 +951,86 @@ class AdaDomain(Domain):
             )
         self.objects[name] = ObjectEntry(self.env.docname, node_id, objtype)
 
+    @staticmethod
+    def add_missing_reference(
+        app: Sphinx,
+        env: BuildEnvironment,
+        node: addnodes.pending_xref,
+        contnode: Element,
+    ) -> Union[Element, None]:
+        """
+        Suggest a close match when an :ada: cross-reference cannot be
+        resolved.
 
-def setup(app: Sphinx) -> None:
+        Sphinx calls registered ``missing-reference`` handlers with the
+        signature ``(app, env, node, contnode)`` (the ``app`` argument is
+        passed implicitly when handlers are connected as bound methods).
+        Returning a non-``None`` node replaces the unresolved-ref rendering
+        in the output; returning ``None`` falls through to Sphinx's
+        default "undefined label" warning.
+
+        For the Ada domain we look up the requested name in the domain's
+        ``objects`` table and, if found, render the resolved
+        cross-reference. This catches the common case where the user
+        writes ``:ada:func:`Foo`` in a document whose current package is
+        ``Ada.Pkg`` and the actual target is ``Ada.Pkg.Foo`` -- Sphinx's
+        stock resolver will already have tried the current-package prefix
+        via ``resolve_xref`` and failed; we re-attempt here with a wider
+        search.
+        """
+        domain = env.get_domain("ada")
+        target = node.get("reftarget", "")
+        objects = domain.objects
+
+        # First try: exact match.
+        if target in objects:
+            return None  # Already resolvable; let Sphinx handle it.
+
+        # Second try: same name with the document's current package prefix.
+        modname = node.get("ada:package", "")
+        if modname:
+            candidate = f"{modname}.{target}"
+            if candidate in objects:
+                return make_refnode(
+                    app.builder,
+                    node.get("refdoc", ""),
+                    objects[candidate].docname,
+                    candidate,
+                    contnode,
+                    candidate,
+                )
+
+        # Third try: any object whose name ends with the unresolved target.
+        # Returns the first match (alphabetical) as a suggestion. This is
+        # the "did you mean ...?" behaviour.
+        for fullname in sorted(objects):
+            if (
+                fullname.endswith(f".{target}")
+                or fullname == target
+                or fullname.endswith(target)
+            ):
+                if not isinstance(contnode, nodes.Text):
+                    contnode[0] = nodes.Text(target.split(".")[-1])
+                return make_refnode(
+                    app.builder,
+                    node.get("refdoc", ""),
+                    objects[fullname].docname,
+                    fullname,
+                    contnode,
+                    fullname,
+                )
+
+        # No suggestion; let Sphinx emit its default warning.
+        return None
+
+
+def setup(app: Sphinx) -> ExtensionMetadata:
+    app.require_sphinx("9.0")
     app.add_domain(AdaDomain)
+    app.connect("missing-reference", AdaDomain.add_missing_reference)
+    return {
+        "version": "1.0.fork1",
+        "parallel_read_safe": True,
+        "parallel_write_safe": True,
+        "env_version": 2,
+    }
