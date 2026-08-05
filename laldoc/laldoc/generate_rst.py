@@ -604,7 +604,9 @@ class GenerateDoc(lal.App):
                                  lal.GenericPackageInstantiation,
                                  lal.GenericSubpInstantiation,
                                  lal.GenericPackageDecl,
-                                 lal.PackageDecl):
+                                 lal.PackageDecl,
+                                 lal.NumberDecl,
+                                 lal.NullSubpDecl):
                     self.warn('default entity handling for '
                               f'{P.relpath(decl.unit.filename)}:{decl}')
                 append_decl(decl)
@@ -650,6 +652,22 @@ class GenerateDoc(lal.App):
                 f"{UNDERLINES[self._package_nesting_level] * len(pkg_name )}"
             )
             self.add_lines(['', f".. ada:set_package:: {pkg_name}"])
+            # Emit a ``:with:`` body field listing the package's
+            # ``with`` clauses (the dependencies it imports
+            # from). This gives the reader a quick map of the
+            # external surface without having to load the
+            # source file. Only emitted for top-level packages;
+            # nested packages inherit the parent's ``with``
+            # context. ``UseClause`` (renamings of imported
+            # entities) is also surfaced under the same
+            # field; we accept the slight format mixing in
+            # exchange for the field being a single block.
+            with_uses_lines = self._collect_with_uses(
+                package_decl.unit
+            )
+            if with_uses_lines:
+                self.add_lines([''])
+                self.add_lines(with_uses_lines)
             # When the package is a thin generic template (the
             # caller passed ``gen_package``), also emit the
             # ``.. ada:generic_package::`` directive for the
@@ -740,6 +758,7 @@ class GenerateDoc(lal.App):
             if pragmas:
                 self._emit_pragmas_body_field(decl)
             self._emit_aspects_body_field(decl)
+            self._emit_spark_mode_field(decl)
             # Walk the protected body.
             self._emit_protected_body(decl)
 
@@ -797,6 +816,134 @@ class GenerateDoc(lal.App):
         if comp.f_default_expr:
             type_text += " := " + comp.f_default_expr.text
         self.add_lines([f":component: ``{type_text}``  {names_text}"])
+
+    def _fall_through_to_default_handler(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit a warning for a decl that laldoc does not know how
+        to handle, and render the full source text as a
+        literal code block. This is the catch-all used by
+        handlers that need to bail out of their specialised
+        logic. We do NOT call ``handle_decl_generic`` because
+        that's a different code path (the AutoPackage
+        directive's handler); ``generate_rst.py`` has no
+        equivalent. Instead, the source text goes into a
+        ``.. code-block:: ada`` block under a placeholder
+        paragraph so the reader at least sees the source.
+        """
+        self.warn(
+            f"default entity handling for {P.relpath(decl.unit.filename)}:{decl}"
+        )
+        self.add_lines([''])
+        self.add_string(f".. code-block:: ada")
+        with self.indent():
+            for line in decl.text.splitlines():
+                self.add_lines([line])
+
+    def _collect_with_uses(self, unit) -> List[str]:
+        """
+        Collect the ``with`` and ``use`` clauses from the
+        given compilation unit's prelude and format them as a
+        list of Sphinx Field lines for the
+        ``ada:set_package::``-anchored ``:with:`` field.
+
+        Each line is one ``:with:`` body field. The body
+        is the source text of the clause (``with Foo.Bar;`` /
+        ``use Foo;`` / etc.). Lines that span multiple
+        source lines (e.g. a ``with`` clause with several
+        packages) are collapsed to a single line so the
+        Sphinx Field parser can read them as one paragraph.
+
+        Returns an empty list when the unit has no
+        ``with`` or ``use`` clauses.
+        """
+        lines: List[str] = []
+        if unit is None or unit.root is None:
+            return lines
+        # The unit's prelude is a list of WithClause / UseClause
+        # nodes. For a ``compilation_rule`` parse the top-level
+        # is a ``CompilationUnit`` whose first child is an
+        # ``AdaNodeList`` (the prelude). For a
+        # ``package_decl_rule`` parse the top-level is the
+        # ``PackageDecl`` directly and there is no prelude.
+        # We walk the children of the root and then any
+        # ``AdaNodeList`` children we find, picking out
+        # ``WithClause`` / ``UseClause`` nodes. This handles
+        # both parse shapes.
+        def walk_for_clauses(node, depth: int = 0) -> None:
+            if depth > 1:
+                return
+            for child in node:
+                if child.is_a(lal.WithClause):
+                    collapsed = " ".join(
+                        ln.strip() for ln in child.text.splitlines()
+                        if ln.strip()
+                    )
+                    lines.append(f":with: ``{collapsed}``")
+                elif child.is_a(lal.UseClause):
+                    collapsed = " ".join(
+                        ln.strip() for ln in child.text.splitlines()
+                        if ln.strip()
+                    )
+                    lines.append(f":with: ``{collapsed}``")
+                elif child.is_a(lal.AdaNodeList):
+                    # Prelude list: recurse one level.
+                    walk_for_clauses(child, depth + 1)
+
+        walk_for_clauses(unit.root)
+        return lines
+
+    def _emit_spark_mode_field(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit a ``:spark_mode:`` body field on a decl that
+        carries a SPARK ``SPARK_Mode`` aspect. The field
+        tells the reader whether the entity is verified by
+        the SPARK proof toolchain (``On``), explicitly
+        excluded (``Off``), or unspecified (in which case
+        we fall back to ``p_is_subject_to_proof`` to give a
+        derived answer).
+
+        The libadalang property ``p_spark_mode_aspect``
+        raises ``PropertyError`` on malformed ASTs (the
+        same null-deref family as
+        ``p_designated_type_decl``); we wrap defensively.
+        When neither ``p_spark_mode_aspect`` nor
+        ``p_is_subject_to_proof`` can answer, we skip the
+        field — emitting "SPARK mode: unknown" would be
+        worse than silent.
+        """
+        if not isinstance(decl, lal.BasicSubpDecl) and \
+                not isinstance(decl, lal.BaseTypeDecl) and \
+                not isinstance(decl, lal.ObjectDecl):
+            return
+        mode = None
+        try:
+            asp = decl.p_spark_mode_aspect
+            if asp is not None and asp.exists:
+                # The aspect's ``value`` is an ``Id`` node
+                # whose ``text`` is ``"On"`` / ``"Off"``.
+                if asp.value is not None and hasattr(
+                    asp.value, "text"
+                ):
+                    mode = asp.value.text
+        except (lal.PropertyError, AttributeError):
+            pass
+        if mode is None:
+            # No explicit aspect; check the derived property
+            # ``p_is_subject_to_proof``. This is True iff the
+            # enclosing package has ``SPARK_Mode => On``
+            # and the entity isn't explicitly ``=> Off``.
+            try:
+                mode = ("On"
+                        if decl.p_is_subject_to_proof
+                        else "Off")
+            except lal.PropertyError:
+                return
+        if mode is None:
+            return
+        # Add a blank line BEFORE the field to flip
+        # docutils to body-field-parsing mode.
+        self.add_lines([''])
+        self.add_lines([f":spark_mode: ``{mode}``"])
 
     def _emit_representation_clauses(self, decl: lal.BasicDecl) -> None:
         """
@@ -899,34 +1046,80 @@ class GenerateDoc(lal.App):
             return
         if not decl.f_aspects:
             return
-        # Map aspect name -> Sphinx field marker.
-        aspect_to_field = {
-            "Pre": ":pre:",
-            "Post": ":post:",
-            "Contract_Cases": ":contract_cases:",
-            "Inline": ":inline:",
-            "Global": ":global:",
-            "No_Return": ":no_return:",
-            "Convention": ":convention:",
-            "Import": ":import_kind:",
-            "External": ":external:",
-            "Link_Name": ":link_name:",
+        # Map aspect name -> (group, field marker). Aspects
+        # are organised into three groups:
+        #
+        #   - ``contracts``: Pre, Post, Contract_Cases.
+        #     These are the runtime contract assertions
+        #     (``precondition`` / ``postcondition`` /
+        #     ``contract_cases``) that the compiler emits
+        #     checks for. Grouping them under a single
+        #     "Contracts" header tells the reader "this
+        #     subprogram has runtime checks" at a glance.
+        #
+        #   - ``typing``: Convention, Import, External,
+        #     Link_Name. These are the C-binding aspects
+        #     that tell the reader this entity is bound to a
+        #     foreign language / C ABI. Grouping them under
+        #     "Binding" header is the explicit
+        #     thick-vs-thin signal.
+        #
+        #   - ``optimization``: Inline, Global, No_Return.
+        #     These tell the compiler / linker how to emit
+        #     the subprogram. Grouping them under
+        #     "Optimization" header separates the
+        #     performance hints from the contract and
+        #     binding surfaces.
+        aspect_groups = {
+            "Pre": ("contracts", ":pre:"),
+            "Post": ("contracts", ":post:"),
+            "Contract_Cases": ("contracts", ":contract_cases:"),
+            "Convention": ("typing", ":convention:"),
+            "Import": ("typing", ":import_kind:"),
+            "External": ("typing", ":external:"),
+            "Link_Name": ("typing", ":link_name:"),
+            "Inline": ("optimization", ":inline:"),
+            "Global": ("optimization", ":global:"),
+            "No_Return": ("optimization", ":no_return:"),
         }
-        # Walk aspects in source order. Preserve the order in
-        # which they appear on the decl.
-        emitted: List[str] = []
+        # Group key -> ordered list of (field_marker, expr)
+        # pairs. Source order within a group is preserved.
+        groups: Dict[str, List[Tuple[str, str]]] = {
+            "contracts": [],
+            "typing": [],
+            "optimization": [],
+        }
         for a in decl.f_aspects.f_aspect_assocs:
             name = a.f_id.text if a.f_id and a.f_id.text else None
-            if not name or name not in aspect_to_field:
+            if not name or name not in aspect_groups:
                 continue
-            field_marker = aspect_to_field[name]
+            group_name, field_marker = aspect_groups[name]
             expr = a.f_expr.text if a.f_expr else ""
-            if not emitted:
-                # First field: emit a blank line BEFORE so
-                # docutils flips to body-field-parsing mode.
-                self.add_lines([''])
-            self.add_lines([f"{field_marker} ``{expr}``"])
-            emitted.append(name)
+            groups[group_name].append((field_marker, expr))
+        # Skip the emit if no group has any aspect.
+        if not any(groups.values()):
+            return
+        # Header text per group. The header is a single
+        # paragraph at the same indent as ``:package:`` /
+        # ``:pragmas:``; the body field is emitted below it
+        # at the same indent. The blank line BEFORE the
+        # first field flips docutils to body-field-parsing
+        # mode (the body-vs-option trap from pitfall #0b).
+        group_labels = {
+            "contracts": "**Contracts**",
+            "typing": "**Binding**",
+            "optimization": "**Optimization**",
+        }
+        # We emit each non-empty group in the order
+        # ``contracts`` / ``typing`` / ``optimization`` —
+        # the most-common group (contracts) comes first.
+        for group_name in ("contracts", "typing", "optimization"):
+            if not groups[group_name]:
+                continue
+            self.add_lines([''])
+            self.add_lines([group_labels[group_name]])
+            for field_marker, expr in groups[group_name]:
+                self.add_lines([f"   {field_marker} ``{expr}``"])
 
     def _emit_pragmas_body_field(self, decl: lal.BasicDecl) -> None:
         """
@@ -1126,6 +1319,37 @@ class GenerateDoc(lal.App):
                 )
             emit_directive(f".. ada:{subp_kind}:: {prof}")
 
+            # If this is a ``NullSubpDecl`` (e.g.
+            # ``procedure Reset is null;``), emit an
+            # ``:is_null:`` body field so the reader knows the
+            # body is intentionally empty. Without this tag,
+            # the rendered page would look like a normal
+            # subprogram declaration with no body at all,
+            # which is misleading: a null body is a deliberate
+            # design choice (e.g. visitor pattern, abstract
+            # base class, dispatch table stub) and the reader
+            # needs to know.
+            if isinstance(decl, lal.NullSubpDecl):
+                self.add_lines([''])
+                self.add_string(':is_null: ``True``')
+
+            # If this is a ``SubpRenamingDecl`` (e.g.
+            # ``function Aliased renames Real_Impl;``), emit
+            # a ``:renames:`` body field with the target
+            # subprogram's name. Thin C bindings often use
+            # this pattern to expose an Ada-friendly alias
+            # for a C entry point while keeping the original
+            # name available for matching the C ABI.
+            if isinstance(decl, lal.SubpRenamingDecl):
+                if decl.f_renames:
+                    target = strip_ws(
+                        decl.f_renames.text
+                    ).removeprefix('renames').strip()
+                    self.add_lines([''])
+                    self.add_string(
+                        f":renames_target: ``{target}``"
+                    )
+
             for formal in decl.p_subp_spec_or_null().p_abstract_formal_params:
                 formal_doc, annots = self.get_documentation(formal)
 
@@ -1150,6 +1374,7 @@ class GenerateDoc(lal.App):
             # ada-sphinx-docs-pitfall).
             with self.indent():
                 self._emit_aspects_body_field(decl)
+                self._emit_spark_mode_field(decl)
 
         elif isinstance(decl, lal.BaseTypeDecl):
             if isinstance(decl, lal.IncompleteTypeDecl):
@@ -1174,6 +1399,7 @@ class GenerateDoc(lal.App):
             # Link_Name, ...) at the same indent as :package:.
             with self.indent():
                 self._emit_aspects_body_field(decl)
+                self._emit_spark_mode_field(decl)
 
                 # Emit C-struct layout representation clauses
                 # (``for T'Size use 32``, ``for T use record ...``
@@ -1304,6 +1530,28 @@ class GenerateDoc(lal.App):
                 # ``with self.indent()``, so the aspect fields
                 # land at the same indent as :objtype:.
                 self._emit_aspects_body_field(decl)
+                self._emit_spark_mode_field(decl)
+
+        elif isinstance(decl, lal.NumberDecl):
+            # NumberDecl is the Ada 2022 "number declaration"
+            # shape: ``Twelve : constant := 12;``. It has no
+            # type expression (the type is inferred from the
+            # expression), only ``f_ids`` (the names list) and
+            # ``f_expr`` (the expression text). Reuse the
+            # ``ada:object::`` directive shape because the
+            # upstream adadomain handler treats it identically;
+            # readers see the same "Object declaration" label.
+            descr = strip_ws(decl.text)
+            emit_directive(f".. ada:object:: {descr}")
+            with self.indent():
+                self.add_lines([''])
+                # ObjectDecl's ":objtype:" field has no analogue
+                # for NumberDecl (no f_type_expr). Emit a
+                # ":defval:" instead so the value is visible.
+                if decl.f_expr:
+                    self.add_string(
+                        f":defval: ``{strip_ws(decl.f_expr.text)}``"
+                    )
 
         elif isinstance(decl, lal.PackageRenamingDecl):
             name = decl.p_defining_name.text
