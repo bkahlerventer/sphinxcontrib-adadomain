@@ -79,6 +79,28 @@ class GenerateDoc(lal.App):
     lines: List[str]
     _indent: int
     _package_nesting_level: int
+    # The leading ``PragmaNode`` siblings of the decl currently being
+    # handled. Set by ``handle_package`` before each call to
+    # ``handle_entity``; read-and-cleared by
+    # ``_emit_leading_pragmas_field`` so pragma state never leaks
+    # across decls.
+    _leading_pragmas: List[lal.PragmaNode]
+
+    # Pragmas whose semantics are also exposed as aspects on the same
+    # entity. When a pragma in this set appears as a leading pragma,
+    # it is documented under the corresponding aspect field rather
+    # than under the generic ``:pragmas:`` field, to avoid duplication.
+    _pragma_to_aspect_map: Dict[str, str] = {
+        "Convention": "Convention",
+        "Import": "Import",
+        "External": "External",
+        "Link_Name": "Link_Name",
+        "Precondition": "Pre",
+        "Postcondition": "Post",
+        "Inline": "Inline",
+        "No_Return": "No_Return",
+        "Global": "Global",
+    }
 
     def add_string(self, strn: str):
         """
@@ -205,6 +227,7 @@ class GenerateDoc(lal.App):
         self.lines = []
         self._indent = 0
         self._package_nesting_level = 0
+        self._leading_pragmas = []
 
         os.makedirs(self.args.output_dir, exist_ok=True)
 
@@ -409,13 +432,126 @@ class GenerateDoc(lal.App):
         # Go through all declarations that appear in the top-level package and
         # organize them in sections the way we want to document them.
 
-        decls = [d.cast(lal.BasicDecl)
-                 for d in package_decl.f_public_part.f_decls
-                 if d.is_a(lal.BasicDecl)]
+        # Associate leading AND trailing PragmaNodes with the nearest decl
+        # in source order. Ada code uses both shapes:
+        #   type T is ...; pragma Convention (C, T);   -- trailing
+        #   pragma Convention (C, T); type T is ...;   -- leading
+        # Both are siblings of ``f_public_part.f_decls``. We attach
+        # every pragma to the nearest decl in source order so the
+        # binding info travels with the directive.
+        #
+        # The same algorithm also associates C-struct layout
+        # representation clauses (``for T'Size use 32`` /
+        # ``AttributeDefClause`` and ``for T use record ...``
+        # ``RecordRepClause`` / ``ComponentClause``) with their
+        # target type decl. These clauses live as siblings in
+        # ``f_public_part.f_decls`` and carry C binding layout
+        # info that the existing laldoc emit path silently
+        # dropped.
+        #
+        # Two-pass algorithm: first partition the public part into a
+        # list of decls and an ordered list of (decl_index, item)
+        # tuples where ``decl_index`` is the index of the FIRST decl
+        # that comes AFTER the item (so ``k == len(decls_so_far)``
+        # at the time the item was seen). Then attach each item to
+        # ``decls[k-1]`` (trailing) if k > 0, else to ``decls[0]``
+        # (leading). Items with no decl after them are dropped.
+        decls: List[lal.BasicDecl] = []
+        pragma_seq: List[Tuple[int, lal.PragmaNode]] = []
+        rep_seq: List[Tuple[int, lal.RecordRepClause]] = []
+        attr_seq: List[Tuple[int, lal.AttributeDefClause]] = []
+        for raw in package_decl.f_public_part.f_decls:
+            if raw.is_a(lal.PragmaNode):
+                pragma_seq.append(
+                    (len(decls), raw.cast(lal.PragmaNode))
+                )
+                continue
+            if raw.is_a(lal.RecordRepClause):
+                rep_seq.append(
+                    (len(decls), raw.cast(lal.RecordRepClause))
+                )
+                continue
+            if raw.is_a(lal.AttributeDefClause):
+                # AttributeDefClause is the parent class for
+                # ``for X'Size use ...`` and similar.
+                # EnumRepClause is a sibling. We accept either;
+                # any AttributeDefClause-shaped node goes here.
+                attr_seq.append(
+                    (len(decls), raw.cast(lal.AttributeDefClause))
+                )
+                continue
+            if not raw.is_a(lal.BasicDecl):
+                continue
+            decls.append(raw.cast(lal.BasicDecl))
+        decls_with_pragmas: List[Tuple[lal.BasicDecl,
+                                        List[lal.PragmaNode]]] = [
+            (d, []) for d in decls
+        ]
+        for k, p in pragma_seq:
+            if k > 0:
+                idx = k - 1
+                pd, p_lead = decls_with_pragmas[idx]
+                decls_with_pragmas[idx] = (pd, p_lead + [p])
+            elif decls:
+                pd, p_lead = decls_with_pragmas[0]
+                decls_with_pragmas[0] = (pd, p_lead + [p])
+            # else: pragma at the start of the package with no
+            # following decl; dropped on the floor (it would
+            # document itself).
+
+        # Per-decl map keyed by ``id(decl)``. We need this map
+        # because the outer loop below collects all decls into
+        # ``toplevel_decls`` before any ``handle_entity`` is
+        # invoked; an instance attribute would be overwritten on
+        # every outer-loop iteration and only the LAST decl's
+        # pragmas would survive into the ``handle_decl`` phase.
+        # ``lal.BasicDecl`` is not hashable, so we use ``id``.
+        pragmas_by_decl_id: Dict[int, List[lal.PragmaNode]] = {
+            id(d): list(pragmas)
+            for d, pragmas in decls_with_pragmas
+        }
+
+        # Representation clauses grouped by id(decl). Same
+        # trailing/leading semantics as pragmas.
+        rep_clauses_by_decl_id: Dict[
+            int, List[Tuple[str, lal.RecordRepClause]]
+        ] = {}
+        for k, r in rep_seq:
+            target = decls[k-1] if k > 0 else (decls[0] if decls else None)
+            if target is None:
+                continue
+            rep_clauses_by_decl_id.setdefault(id(target), []).append(
+                ("record", r)
+            )
+        attr_clauses_by_decl_id: Dict[
+            int, List[Tuple[str, lal.AttributeDefClause]]
+        ] = {}
+        for k, a in attr_seq:
+            target = decls[k-1] if k > 0 else (decls[0] if decls else None)
+            if target is None:
+                continue
+            attr_clauses_by_decl_id.setdefault(id(target), []).append(
+                ("attribute", a)
+            )
+        # Surface the maps on ``self`` so ``handle_entity`` (called
+        # via ``handle_decl`` in the toplevel loop below, possibly
+        # long after this local scope has exited) can read them.
+        # Same id-based pattern as ``pragmas_by_decl_id`` above.
+        self._rep_clauses_by_decl_id = rep_clauses_by_decl_id
+        self._attr_clauses_by_decl_id = attr_clauses_by_decl_id
+
+        decls = [d for d, _ in decls_with_pragmas]
 
         types = {}
 
         for decl in decls:
+            # Surface the leading pragmas to ``handle_entity`` via the
+            # per-decl map. ``handle_entity`` reads and clears the
+            # entry so pragma state never leaks across decls.
+            self._leading_pragmas = list(
+                pragmas_by_decl_id.get(id(decl), [])
+            )
+
             _, annotations = self.get_documentation(decl)
 
             # Skip documentation for this entity
@@ -488,9 +624,24 @@ class GenerateDoc(lal.App):
             elif decl.is_a(lal.GenericPackageDecl):
                 self.handle_package(decl.f_package_decl, gen_package=decl)
             else:
+                # Surface the leading pragmas to
+                # ``handle_entity`` via the per-decl map. This is the
+                # second of three sites where
+                # ``self._leading_pragmas`` is set; the third is the
+                # associated-decls loop below. All three sites must
+                # agree because ``handle_entity`` consumes the slot
+                # via ``_emit_leading_pragmas_field``.
+                self._leading_pragmas = list(
+                    pragmas_by_decl_id.get(id(decl), [])
+                )
                 self.handle_entity(decl)
                 with self.indent():
                     for assoc_decls in associated_decls[decl]:
+                        # Re-set for each associated decl so
+                        # ``handle_entity`` sees the correct list.
+                        self._leading_pragmas = list(
+                            pragmas_by_decl_id.get(id(assoc_decls), [])
+                        )
                         self.handle_entity(assoc_decls)
 
         if self._package_nesting_level == 0:
@@ -519,16 +670,338 @@ class GenerateDoc(lal.App):
 
             with self.indent():
                 for decl in gen_package.f_formal_part.f_decls:
+                    self._leading_pragmas = list(
+                        pragmas_by_decl_id.get(id(decl), [])
+                    )
                     handle_decl(decl)
 
-        # Go through all entities to generate their documentation
+        # Go through all entities to generate their documentation.
+        # We re-set ``self._leading_pragmas`` before each call so the
+        # correct pragma list travels with the decl that
+        # ``handle_decl`` is about to dispatch. (The outer loop above
+        # ALSO sets it per iteration, but those values get overwritten
+        # on every iteration, so by the time we get here only the
+        # LAST decl's pragmas would survive; we re-set explicitly to
+        # make the per-decl binding precise.)
         self._package_nesting_level += 1
         for decl in toplevel_decls:
+            self._leading_pragmas = list(
+                pragmas_by_decl_id.get(id(decl), [])
+            )
             handle_decl(decl)
         self._package_nesting_level -= 1
 
         if self._package_nesting_level != 0:
             self._indent -= 4
+
+    def _handle_protected_type(self, decl: lal.ProtectedTypeDecl) -> None:
+        """
+        Emit documentation for a protected type decl. The
+        protected type's body (``protected type X is ... end
+        X;``) contains subprograms, entries, and components.
+        The public part is emitted like any other type via the
+        ``.. ada:type::`` directive; the protected body's
+        subprograms and entries are emitted as nested child
+        directives.
+
+        Note that the existing ``p_discriminants_list`` defensive
+        patch in ``handle_entity`` (line ~660) prevents the
+        parameterless-protected-type null-deref that crashed
+        laldoc on the Vulkan.Callback_Marshallers reproducer.
+        The patch is portable: when the libadalang bug is
+        fixed upstream and the property returns an empty list,
+        the ``for`` loop simply does not execute, which is the
+        correct behaviour. This handler does not need to repeat
+        that defensive patch.
+
+        The private part (``private ... end``) is documented
+        only if its ``Component`` decls are documented via
+        ``:component:``; otherwise the private part is silent.
+        Project convention: skip the private data section; the
+        state of a protected object is an implementation
+        detail, not a public API.
+        """
+        prof = f"type {decl.p_relative_name.text}"
+        # Wrap the type directive emission so :package: lands at
+        # the right indent. We deliberately do NOT use
+        # ``emit_directive`` because that closure also calls
+        # ``_emit_pragmas_body_field`` which depends on
+        # ``self._leading_pragmas`` being set; for a
+        # ProtectedTypeDecl at the top level, that slot was
+        # already populated by the partition pass in
+        # ``handle_package``.
+        self.add_lines([f".. ada:type:: {prof}"])
+        with self.indent():
+            self.add_lines([
+                ":package: "
+                f"{decl.p_parent_basic_decl.p_fully_qualified_name}"
+            ])
+            pragmas = getattr(self, '_leading_pragmas', None)
+            if pragmas:
+                self._emit_pragmas_body_field(decl)
+            self._emit_aspects_body_field(decl)
+            # Walk the protected body.
+            self._emit_protected_body(decl)
+
+    def _emit_protected_body(self, decl: lal.ProtectedTypeDecl) -> None:
+        """
+        Walk a protected type's body (``f_definition``) and emit
+        child directives for each subprogram / entry. Components
+        in the private section are surfaced as ``:component:``
+        fields under a private-section header. We do not recurse
+        into nested protected types or nested packages; the
+        current scope is one protected type.
+        """
+        definition = decl.f_definition
+        if definition is None:
+            return
+        public_part = definition.f_public_part
+        if public_part:
+            self.add_lines([''])
+            self.add_lines(['Public operations:'])
+            with self.indent():
+                for sub in public_part.f_decls:
+                    if not isinstance(sub, lal.BasicDecl):
+                        continue
+                    self._leading_pragmas = []
+                    self.handle_entity(sub)
+                    self._leading_pragmas = []
+        private_part = definition.f_private_part
+        if private_part:
+            self.add_lines([''])
+            self.add_lines(['Private state:'])
+            with self.indent():
+                for comp in private_part.f_decls:
+                    if isinstance(comp, lal.ComponentDecl):
+                        # Components are exposed as
+                        # ``:component:`` fields, not as their
+                        # own ``ada:type::`` directive.
+                        self._emit_component_field(comp)
+
+    def _emit_component_field(self, comp: lal.ComponentDecl) -> None:
+        """
+        Emit a ``:component:`` body field for one component of
+        a protected type's private section. The field body is
+        the component's source text.
+        """
+        # ComponentDecl carries the names and type as separate
+        # fields. Walk ``f_ids`` for the names list and
+        # ``f_component_def`` for the type expression.
+        names_text = ""
+        if comp.f_ids:
+            names_text = ", ".join(
+                i.text for i in comp.f_ids
+            )
+        type_text = comp.f_component_def.text if \
+            comp.f_component_def else "?"
+        if comp.f_default_expr:
+            type_text += " := " + comp.f_default_expr.text
+        self.add_lines([f":component: ``{type_text}``  {names_text}"])
+
+    def _emit_representation_clauses(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit C-struct layout representation clauses (``for T'Size
+        use 32`` and ``for T use record ... Component at ... range
+        ...``) as a single ``:representation:`` Sphinx body field.
+        The clauses were associated with ``decl`` in the
+        trailing/leading partition pass at the top of
+        ``handle_package``; this method reads them from the
+        ``rep_clauses_by_decl_id`` and ``attr_clauses_by_decl_id``
+        instance attributes that the partition populates.
+
+        Output shape: one ``:representation:`` line per clause,
+        with the clause's source text as the body. The source text
+        already includes the ``for`` keyword and trailing ``;``.
+
+        A blank line is emitted before the first field so
+        docutils flips from option-parsing to body-field-parsing
+        (the body-vs-option trap from pitfall #0b of
+        ada-sphinx-docs-pitfall).
+        """
+        # The partition maps were built at the top of
+        # ``handle_package`` and are looked up here. We use the
+        # closure-bound locals if available; if not, no clauses.
+        rep_clauses_by_decl_id = getattr(
+            self, '_rep_clauses_by_decl_id', None
+        )
+        attr_clauses_by_decl_id = getattr(
+            self, '_attr_clauses_by_decl_id', None
+        )
+        if rep_clauses_by_decl_id is None and \
+                attr_clauses_by_decl_id is None:
+            return
+        items: List[Tuple[str, str]] = []
+        if rep_clauses_by_decl_id is not None:
+            for kind, r in rep_clauses_by_decl_id.get(id(decl), []):
+                # Strip the trailing semicolon and trailing
+                # whitespace; Sphinx Field body is a single
+                # paragraph.
+                items.append((kind, r.text.strip().rstrip(';').rstrip()))
+        if attr_clauses_by_decl_id is not None:
+            for kind, a in attr_clauses_by_decl_id.get(id(decl), []):
+                items.append((kind, a.text.strip().rstrip(';').rstrip()))
+        if not items:
+            return
+        # Blank line BEFORE the field flips docutils to
+        # body-field-parsing.
+        self.add_lines([''])
+        for kind, text in items:
+            # Sphinx Field bodies must be a single paragraph (no
+            # blank lines in the middle). The RecordRepClause
+            # source text can span multiple lines
+            # (``for T use record\n  Comp at ...\n  ...\nend record``)
+            # so collapse to a single line here. Newlines inside
+            # ````...```` would break the field parser.
+            collapsed = " ".join(
+                ln.strip() for ln in text.splitlines()
+                if ln.strip()
+            )
+            self.add_lines(
+                [f":representation: ``{collapsed};``"]
+            )
+
+    def _emit_aspects_body_field(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit contract / typing / optimization aspects as Sphinx
+        body fields. The aspect names and their preferred field
+        labels are registered in ``sphinxcontrib.adadomain.AdaObject``
+        (``doc_field_types``). Supported aspects:
+
+          - ``Pre``           -> ``:pre:``
+          - ``Post``          -> ``:post:``
+          - ``Contract_Cases`` -> ``:contract_cases:``
+          - ``Inline``        -> ``:inline:``
+          - ``Global``        -> ``:global:``
+          - ``No_Return``     -> ``:no_return:``
+          - ``Convention``    -> ``:convention:``
+          - ``Import``        -> ``:import_kind:`` (the field
+            is named ``import_kind`` to avoid colliding with
+            Sphinx's built-in ``:import:``)
+          - ``External``      -> ``:external:``
+          - ``Link_Name``     -> ``:link_name:``
+
+        Each aspect's expression text is the field body. A blank
+        line is emitted before the FIRST field so docutils parses
+        it as a body field, not a directive option. Aspects that
+        are not in the supported set are silently skipped (they
+        document themselves in the doc-comment text).
+
+        Pragmas in ``_pragma_to_aspect_map`` that map to these
+        aspect names are already deduped by A1 (the ``:pragmas:``
+        emit skips them), so the aspect field is the SOLE place a
+        reader sees e.g. ``pragma Convention (C, T);``.
+        """
+        if not isinstance(decl, lal.BasicSubpDecl) and \
+                not isinstance(decl, lal.BaseTypeDecl) and \
+                not isinstance(decl, lal.ObjectDecl):
+            # Aspects only meaningful on subprograms, types,
+            # and objects. Other decls are skipped.
+            return
+        if not decl.f_aspects:
+            return
+        # Map aspect name -> Sphinx field marker.
+        aspect_to_field = {
+            "Pre": ":pre:",
+            "Post": ":post:",
+            "Contract_Cases": ":contract_cases:",
+            "Inline": ":inline:",
+            "Global": ":global:",
+            "No_Return": ":no_return:",
+            "Convention": ":convention:",
+            "Import": ":import_kind:",
+            "External": ":external:",
+            "Link_Name": ":link_name:",
+        }
+        # Walk aspects in source order. Preserve the order in
+        # which they appear on the decl.
+        emitted: List[str] = []
+        for a in decl.f_aspects.f_aspect_assocs:
+            name = a.f_id.text if a.f_id and a.f_id.text else None
+            if not name or name not in aspect_to_field:
+                continue
+            field_marker = aspect_to_field[name]
+            expr = a.f_expr.text if a.f_expr else ""
+            if not emitted:
+                # First field: emit a blank line BEFORE so
+                # docutils flips to body-field-parsing mode.
+                self.add_lines([''])
+            self.add_lines([f"{field_marker} ``{expr}``"])
+            emitted.append(name)
+
+    def _emit_pragmas_body_field(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit a ``:pragmas:`` Sphinx body field listing every
+        leading pragma that is NOT also exposed as an aspect on
+        the same entity. Emits a blank line before the field so
+        docutils parses it as a body field, not a directive
+        option. Always clears ``self._leading_pragmas`` so the
+        slot does not leak across decls.
+
+        Pragmas in ``_pragma_to_aspect_map`` whose corresponding
+        aspect is present on the entity (e.g. ``pragma Convention``
+        alongside ``with Convention => C``) are skipped to avoid
+        duplication. Pragmas with no aspect mapping (``Linker_Section``,
+        ``Volatile``, ``Atomic``, ``Suppress``, ``Warnings``,
+        ``Inspection_Point``, ``List``, ``Pack``, ``Default_Sentinel``,
+        ``Common_Obj``, ...) are emitted as one ``:pragmas:``
+        field with a backtick-quoted expression.
+        """
+        pragmas = getattr(self, '_leading_pragmas', None)
+        if pragmas is None:
+            self._leading_pragmas = []
+            return
+
+        # Pre-compute which aspect names are present on ``decl`` so
+        # we can dedup without calling ``p_get_aspect`` per pragma
+        # (which can raise on a null access for malformed AST).
+        aspect_names_present: Set[str] = set()
+        if decl.f_aspects:
+            for a in decl.f_aspects.f_aspect_assocs:
+                if a.f_id and a.f_id.text:
+                    aspect_names_present.add(a.f_id.text)
+
+        # Build the list of pragmas worth emitting. Drop the ones
+        # whose aspect is already on the entity. Preserve source
+        # order.
+        keep: List[lal.PragmaNode] = []
+        for p in pragmas:
+            pname = p.f_id.text if p.f_id else None
+            if pname and pname in self._pragma_to_aspect_map:
+                aspect_name = self._pragma_to_aspect_map[pname]
+                if aspect_name in aspect_names_present:
+                    # Already documented under the aspect field;
+                    # skip to avoid duplication.
+                    continue
+            keep.append(p)
+
+        # Always clear the slot regardless of what we emit.
+        self._leading_pragmas = []
+
+        if not keep:
+            return
+
+        # Emit a blank line BEFORE the field to flip docutils
+        # from option-parsing to body-field-parsing (see the
+        # body-vs-option trap in ada-sphinx-docs-pitfall pitfall
+        # #0b). Without this blank line, docutils parses
+        # ``:pragmas:`` as a directive OPTION, fails with
+        # ``unknown option: "pragmas"``, and drops the line.
+        self.add_lines([''])
+
+        # Format: one ``:pragmas:`` line per pragma, with the
+        # pragma's args on the same line. Multi-arg pragmas like
+        # ``pragma Convention (C, Handle)`` show as
+        # ``Convention (C, Handle);``. Sphinx Field bodies are
+        # rendered as a single paragraph; using one Field per
+        # pragma keeps each pragma on its own rendered line.
+        for p in keep:
+            pname = p.f_id.text if p.f_id else "<unknown>"
+            if p.f_args and p.f_args.text:
+                self.add_lines(
+                    [f":pragmas: ``pragma {pname} ({p.f_args.text});``"]
+                )
+            else:
+                self.add_lines([f":pragmas: ``pragma {pname};``"])
 
     def handle_entity(self, decl: lal.BasicDecl):
 
@@ -581,14 +1054,76 @@ class GenerateDoc(lal.App):
                     ":package: "
                     f"{decl.p_parent_basic_decl.p_fully_qualified_name}"
                 ])
+                # Emit ``:pragmas:`` body fields for every leading
+                # pragma on ``decl`` that is NOT also exposed as
+                # an aspect on the same entity. Pragmas whose
+                # semantics duplicate an aspect (e.g.
+                # ``pragma Convention`` alongside ``with
+                # Convention => C``) are skipped here so the
+                # aspect-emit path can document them without
+                # duplication. The slot is cleared regardless.
+                #
+                # The blank line BEFORE the ``:pragmas:`` field
+                # is required: without it, docutils parses the
+                # field as a directive OPTION, fails because
+                # ``pragmas`` is not in the Ada domain's
+                # ``option_spec``, and emits ``unknown option:
+                # "pragmas"``. With the blank line, docutils
+                # parses the field as a BODY field, and the
+                # ``:pragmas:`` Field type registered in
+                # ``sphinxcontrib.adadomain.AdaObject`` accepts
+                # it. This is the body-vs-option trap from
+                # ada-sphinx-docs-pitfall pitfall #0b.
+                pragmas = getattr(self, '_leading_pragmas', None)
+                if pragmas:
+                    self._emit_pragmas_body_field(decl)
 
         if is_documentable_subp(decl):
             subp_spec = decl.p_subp_spec_or_null()
-            prof = make_profile(subp_spec)
-            subp_kind = (
-                'procedure' if subp_spec.p_returns is None
-                else 'function'
-            )
+            # ``BasicSubpDecl`` (function / procedure / entry) all
+            # carry a ``subp_spec_or_null`` that resolves to
+            # either ``SubpSpec`` (function / procedure) or
+            # ``EntrySpec`` (entry). The two specs have different
+            # field names: ``f_subp_name`` / ``f_subp_params`` /
+            # ``f_subp_returns`` for SubpSpec; ``f_entry_name`` /
+            # ``f_entry_params`` for EntrySpec. ``make_profile``
+            # only handles the SubpSpec shape; for EntrySpec we
+            # build the profile manually.
+            if isinstance(subp_spec, lal.EntrySpec):
+                entry_name = subp_spec.f_entry_name.text
+                params = ""
+                if subp_spec.f_entry_params:
+                    param_strs = []
+                    for p in subp_spec.f_entry_params.f_params:
+                        nm = strip_ws(p.f_ids.text)
+                        if p.f_type_expr:
+                            te = p.f_type_expr
+                            if te.is_a(lal.AnonymousType):
+                                tt = strip_ws(te.text)
+                            elif te.p_designated_type_decl is None:
+                                tt = strip_ws(te.text)
+                            else:
+                                tt = te.p_designated_type_decl.p_fully_qualified_name
+                        else:
+                            tt = "?"
+                        param_strs.append(f"{nm} : {tt}")
+                    params = "({})".format("; ".join(param_strs))
+                # Emit as ``ada:procedure::`` with just the
+                # entry name and params; the ``ada_subp_sig_re``
+                # regex in sphinxcontrib.adadomain expects
+                # ``procedure Name`` not ``procedure entry Name``.
+                # The "entry" annotation is lost in this
+                # representation; readers see a procedure call
+                # inside the protected type's body, which is
+                # the closest Sphinx has to Ada's entry.
+                prof = f"procedure {entry_name}{params}"
+                subp_kind = 'procedure'
+            else:
+                prof = make_profile(subp_spec)
+                subp_kind = (
+                    'procedure' if subp_spec.p_returns is None
+                    else 'function'
+                )
             emit_directive(f".. ada:{subp_kind}:: {prof}")
 
             for formal in decl.p_subp_spec_or_null().p_abstract_formal_params:
@@ -605,12 +1140,48 @@ class GenerateDoc(lal.App):
                         with self.indent():
                             self.add_lines(doc)
 
+            # Emit contract aspects (Pre, Post, Contract_Cases,
+            # Inline, Global, No_Return, ...) as Sphinx body
+            # fields. We re-enter ``with self.indent()`` to keep
+            # the aspect fields at the same indent as ``:package:``
+            # and ``:pragmas:``. The blank line before the first
+            # field flips docutils to body-field-parsing mode (the
+            # body-vs-option trap from pitfall #0b of
+            # ada-sphinx-docs-pitfall).
+            with self.indent():
+                self._emit_aspects_body_field(decl)
+
         elif isinstance(decl, lal.BaseTypeDecl):
             if isinstance(decl, lal.IncompleteTypeDecl):
                 return
 
+            # ProtectedTypeDecl is a BaseTypeDecl, but the
+            # standard type-handling path doesn't know how to
+            # walk its ``protected ... is ... end`` body.
+            # Dispatch to a dedicated handler that emits
+            # ``ada:type::`` for the protected type itself and
+            # then walks the entries / subprograms inside its
+            # ``f_definition.f_public_part`` /
+            # ``f_definition.f_private_part``.
+            if isinstance(decl, lal.ProtectedTypeDecl):
+                self._handle_protected_type(decl)
+                return
+
             prof = f"type {decl.p_relative_name.text}"
             emit_directive(f".. ada:type:: {prof}")
+
+            # Emit typing aspects (Convention, Import, External,
+            # Link_Name, ...) at the same indent as :package:.
+            with self.indent():
+                self._emit_aspects_body_field(decl)
+
+                # Emit C-struct layout representation clauses
+                # (``for T'Size use 32``, ``for T use record ...``
+                # with ``Component at ... range ...`` lines) as a
+                # Sphinx body field. The clauses were associated
+                # with this decl in the trailing/leading partition
+                # pass at the top of ``handle_package``.
+                self._emit_representation_clauses(decl)
 
             with self.indent():
                 self.add_lines([''])
@@ -726,6 +1297,13 @@ class GenerateDoc(lal.App):
                             ":renames: "
                             f"{decl.f_renaming_clause.f_renamed_object.text}"
                         )
+                # Emit typing / optimization aspects on the
+                # object (Convention, Import, External,
+                # Link_Name, Volatile, Atomic, ...) as Sphinx
+                # body fields. We're already inside
+                # ``with self.indent()``, so the aspect fields
+                # land at the same indent as :objtype:.
+                self._emit_aspects_body_field(decl)
 
         elif isinstance(decl, lal.PackageRenamingDecl):
             name = decl.p_defining_name.text
@@ -790,7 +1368,25 @@ class GenerateDoc(lal.App):
                         generic_fqn = "?"
                 self.add_string(f":instpkg: {generic_fqn}")
         elif isinstance(decl, lal.GenericFormal):
-            self.handle_entity(decl.f_decl)
+            # Emit a ``:formal_kind:`` body field labelling what
+            # kind of generic formal this is (type, object,
+            # subprogram, package). The reader sees a regular
+            # type/object/subprogram directive but with a tag
+            # above it indicating the formal's role.
+            inner = decl.f_decl
+            kind = "unknown"
+            if isinstance(inner, lal.BaseTypeDecl):
+                kind = "type"
+            elif isinstance(inner, lal.ObjectDecl):
+                kind = "object"
+            elif isinstance(inner, lal.BasicSubpDecl):
+                kind = "subprogram"
+            elif isinstance(inner, lal.PackageDecl) or \
+                    isinstance(inner, lal.BasePackageDecl):
+                kind = "package"
+            self.add_lines([''])
+            self.add_lines([f":formal_kind: {kind}"])
+            self.handle_entity(inner)
             return
         else:
             print(f"WARNING: Non handled entity: {decl}")

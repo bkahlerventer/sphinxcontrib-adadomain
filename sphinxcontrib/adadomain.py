@@ -133,6 +133,12 @@ class AdaObject(ObjectDescription):
             bodyrolename="type",
         ),
         Field(
+            "pragmas",
+            label=_("Pragmas"),
+            has_arg=False,
+            names=("pragmas", "pragma"),
+        ),
+        Field(
             "objtype",
             label=_("Object type"),
             has_arg=False,
