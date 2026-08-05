@@ -99,6 +99,18 @@ class GenerateDoc(lal.App):
             default=".",
             help='Output directory for the generated rst files'
         )
+        # Add additional source directories to the GPR project at
+        # command-line time. The default laldoc workflow requires
+        # every subdirectory holding ``.ads`` files to be listed in
+        # the GPR's ``Source_Dirs``; this argument lets callers add
+        # subdirs without rewriting the GPR. Useful for projects
+        # whose source tree is reorganised frequently.
+        self.parser.add_argument(
+            '--source-dir', action='append', default=[],
+            metavar='DIR',
+            help='Add DIR to the GPR project Source_Dirs at run '
+                 'time. May be passed multiple times.'
+        )
         super(GenerateDoc, self).add_arguments()
 
     @contextmanager
@@ -200,6 +212,24 @@ class GenerateDoc(lal.App):
         for _, unit in sorted(self.units.items()):
             self.process_unit(unit)
 
+    def default_get_files(self):
+        # Override libadalang's App.default_get_files to honour our
+        # ``--source-dir`` flags. The base implementation returns the
+        # GPR project's source files; the override instead walks every
+        # ``--source-dir`` and yields every ``.ads``/``.adb`` under
+        # them, regardless of depth. This avoids the "GPR doesn't
+        # recurse into subdirs" pitfall and lets callers point laldoc
+        # at an existing source tree without rewriting the GPR.
+        if self.args.source_dir:
+            extras: List[str] = []
+            for d in self.args.source_dir:
+                for root, _, files in os.walk(d):
+                    for fn in sorted(files):
+                        if fn.endswith('.ads') or fn.endswith('.adb'):
+                            extras.append(os.path.join(root, fn))
+            return extras
+        return super().default_get_files()
+
     @property
     def description(self) -> str:
         return """
@@ -222,15 +252,50 @@ class GenerateDoc(lal.App):
             self.error('{} is empty'.format(unit.filename))
 
         try:
-            decl = (
-                unit.root.cast(lal.CompilationUnit).f_body
-                .cast(lal.LibraryItem).f_item
-            )
+            # The libadalang root is either a ``CompilationUnit``
+            # (single library unit per file) or a
+            # ``CompilationUnitList`` (multiple library units per
+            # file, e.g. a thick instantiation followed by
+            # additional declarations). We only process the FIRST
+            # ``CompilationUnit``'s decl because laldoc emits one
+            # RST page per source file.
+            root = unit.root
+            if root.is_a(lal.CompilationUnitList):
+                first_cu = None
+                for cu in root:
+                    first_cu = cu
+                    break
+                if first_cu is None:
+                    self.error('{} has no compilation units'.format(
+                        unit.filename
+                    ))
+                    return
+                f_body = first_cu.f_body
+            else:
+                f_body = root.cast(lal.CompilationUnit).f_body
+            decl = f_body.cast(lal.LibraryItem).f_item
 
             if decl.is_a(lal.GenericPackageDecl):
+                # Thin generic template at the top of a library
+                # unit. ``handle_package`` emits the title and the
+                # ``.. ada:set_package::`` directive; the
+                # ``.. ada:generic_package::`` directive for the
+                # template itself is emitted by handle_package
+                # when it sees the ``gen_package`` argument is
+                # non-None (see below).
                 gen_package = decl.cast(lal.GenericPackageDecl)
                 package_decl = gen_package.f_package_decl
                 self.handle_package(package_decl, gen_package)
+            elif decl.is_a(lal.GenericPackageInstantiation):
+                # Top-level library unit whose package declaration is
+                # itself a generic package instantiation. The thin
+                # template's name is exposed via
+                # ``decl.f_generic_pkg_name`` and the actuals via
+                # ``decl.f_params``. We emit the template's body via
+                # ``handle_package`` so any nested decls in the
+                # instantiation's source file are documented too.
+                inst = decl.cast(lal.GenericPackageInstantiation)
+                self.handle_instantiation(inst)
             else:
                 package_decl = decl.cast(lal.BasePackageDecl)
                 self.handle_package(package_decl)
@@ -244,6 +309,72 @@ class GenerateDoc(lal.App):
         except AssertionError:
             print(f"WARNING: Non handled top level decl: {decl}")
             return
+
+    def handle_instantiation(
+        self,
+        inst: lal.GenericPackageInstantiation
+    ) -> None:
+        """
+        Handle a top-level library unit that is itself a generic
+        package instantiation. Emit the same
+        ``ada:generic-package-instantiation`` directive as the
+        nested case, plus the package-level doc.
+
+        Each RST page Sphinx consumes must have a title set off
+        by ``===`` underline characters; laldoc emits these titles
+        from ``p_fully_qualified_name`` for ordinary packages and
+        from the unit's ``f_item`` decl for instantiations.
+        """
+        title = inst.p_fully_qualified_name
+        self.add_lines([title, '=' * len(title), ''])
+
+        pkg_doc, _ = self.get_documentation(inst)
+        if pkg_doc:
+            self.add_lines(pkg_doc)
+            self.add_lines([''])
+
+        sig = strip_ws(lal.Token.text_range(
+            inst.token_start,
+            (inst.f_generic_pkg_name.token_end
+             if inst.f_generic_pkg_name else inst.token_end)
+        ))
+        self.add_lines([f".. ada:generic-package-instantiation:: {sig}"])
+        with self.indent():
+            self.add_lines([''])
+            self.add_string(".. code-block:: ada")
+            with self.indent():
+                self.add_lines([''] + inst.text.splitlines())
+            self.add_lines([''])
+            # Resolve the instantiated generic package back to
+            # its template. ``p_designated_generic_decl`` is the
+            # semantic path but it has two failure modes we work
+            # around here:
+            #   1. cross-file resolution raises ``PropertyError``
+            #      "dereferencing a null access" in libadalang 26.0.0
+            #      when the generic lives in a different file with no
+            #      body stub on disk.
+            #   2. with a GPR-aware unit provider the property
+            #      sometimes returns the right node but
+            #      ``p_fully_qualified_name`` returns the
+            #      instantiation's own name instead of the generic's
+            #      name (observed on the smoke project;
+            #      ``f_package_decl.f_package_name`` returns the
+            #      correct generic-template name in that case).
+            # In both cases ``f_generic_pkg_name.text`` is syntactic
+            # and always correct, so we use it as the authoritative
+            # source and only fall back to semantic resolution when
+            # the syntactic field is null.
+            if inst.f_generic_pkg_name:
+                generic_fqn = inst.f_generic_pkg_name.text
+            else:
+                try:
+                    generic_fqn = (
+                        inst.p_designated_generic_decl
+                        .f_package_decl.f_package_name.text
+                    )
+                except (lal.PropertyError, AttributeError):
+                    generic_fqn = "?"
+            self.add_string(f":instpkg: {generic_fqn}")
 
     def handle_package(
         self,
@@ -368,6 +499,14 @@ class GenerateDoc(lal.App):
                 f"{UNDERLINES[self._package_nesting_level] * len(pkg_name )}"
             )
             self.add_lines(['', f".. ada:set_package:: {pkg_name}"])
+            # When the package is a thin generic template (the
+            # caller passed ``gen_package``), also emit the
+            # ``.. ada:generic_package::`` directive for the
+            # template itself. The directive consumes only the
+            # bare package name; the handler prepends ``generic
+            # package `` annotation in the rendered output.
+            if gen_package is not None:
+                self.add_lines(['', f".. ada:generic_package:: {pkg_name}"])
         else:
             generic = "generic_" if gen_package is not None else ""
             self.add_lines([f".. ada:{generic}package:: {pkg_name}", ""])
@@ -404,6 +543,15 @@ class GenerateDoc(lal.App):
                 # grab their text, but we should expand inner type names too to
                 # be fully qualified.
                 if te.is_a(lal.AnonymousType):
+                    return strip_ws(te.text)
+                # Language-defined types (``Integer``, ``Boolean``,
+                # ``String``, ``Natural``, ``Positive``, ...) have no
+                # ``p_designated_type_decl`` because their declaration
+                # lives in the language runtime, not in user source.
+                # Fall back to the verbatim source text so the docs
+                # still render correctly for functions that take or
+                # return language-defined types.
+                if te.p_designated_type_decl is None:
                     return strip_ws(te.text)
                 else:
                     return te.p_designated_type_decl.p_fully_qualified_name
@@ -591,6 +739,18 @@ class GenerateDoc(lal.App):
             name = decl.p_defining_name.text
             emit_directive(f".. ada:exception:: {name}")
 
+        elif isinstance(decl, lal.GenericPackageDecl):
+            # Thin generic template. Emit ``ada:generic_package`` for
+            # the template itself; the directive consumes only the
+            # bare package name and prepends ``generic package `` in
+            # the rendered signature. The body's own declarations are
+            # emitted as ordinary nested decls by the upstream walk.
+            pkg = decl.f_package_decl
+            name = (pkg.f_package_name.text
+                    if pkg and pkg.f_package_name
+                    else decl.p_defining_name.text)
+            emit_directive(f".. ada:generic_package:: {name}")
+
         elif isinstance(decl, lal.GenericPackageInstantiation):
             sig = strip_ws(lal.Token.text_range(
                 decl.token_start, decl.f_generic_pkg_name.token_end
@@ -602,10 +762,33 @@ class GenerateDoc(lal.App):
                 with self.indent():
                     self.add_lines([''] + decl.text.splitlines())
                 self.add_lines([''])
-                self.add_string(
-                    ":instpkg: "
-                    f"{decl.p_designated_generic_decl.p_fully_qualified_name}"
-                )
+                # Resolve the instantiated generic package back to
+                # its template. ``p_designated_generic_decl`` is the
+                # semantic path but it has two failure modes we work
+                # around here:
+                #   1. cross-file resolution raises ``PropertyError``
+                #      "dereferencing a null access" in libadalang 26.0.0
+                #      when the generic lives in a different file with no
+                #      body stub on disk.
+                #   2. with a GPR-aware unit provider the property
+                #      sometimes returns the right node but
+                #      ``p_fully_qualified_name`` returns the
+                #      instantiation's own name instead of the
+                #      generic's name (``f_package_decl.f_package_name``
+                #      returns the correct template name in that case).
+                # ``f_generic_pkg_name.text`` is syntactic and always
+                # correct, so we prefer it.
+                if decl.f_generic_pkg_name:
+                    generic_fqn = decl.f_generic_pkg_name.text
+                else:
+                    try:
+                        generic_fqn = (
+                            decl.p_designated_generic_decl
+                            .f_package_decl.f_package_name.text
+                        )
+                    except (lal.PropertyError, AttributeError):
+                        generic_fqn = "?"
+                self.add_string(f":instpkg: {generic_fqn}")
         elif isinstance(decl, lal.GenericFormal):
             self.handle_entity(decl.f_decl)
             return

@@ -150,6 +150,7 @@ class AutoPackage(Directive):
             (lal.PackageRenamingDecl, self.handle_package_renaming_decl),
             (lal.GenericPackageInstantiation, self.handle_package_inst),
             (lal.GenericSubpInstantiation, self.handle_subp_inst),
+            (lal.GenericPackageDecl, self.handle_generic_package_decl),
             (lal.ExceptionDecl, self.handle_exception_decl),
         ]:
             types, handler = h[:-1], h[-1]
@@ -270,6 +271,28 @@ class AutoPackage(Directive):
         signode += N.desc_annotation('package ', 'package ')
         signode += N.desc_name(name, name)
         signode += N.desc_annotation(rest, rest)
+
+    def handle_generic_package_decl(self, decl, node, signode,
+                                    annotations):
+        # type: (lal.GenericPackageDecl, N.desc, N.desc_signature) -> None
+        # Emit ``.. ada:generic_package:: <Name>`` for the thin generic
+        # template. The sphinxcontrib.adadomain handler
+        # (handle_gen_package_sig) expects only the bare package name
+        # in the directive sig; it prepends ``generic package ``
+        # annotation itself.
+        node['objtype'] = node['desctype'] = decl.kind_name
+
+        # The ``f_package_decl`` child is the BasePackageDecl whose
+        # ``f_package_name`` carries the name. When the generic is the
+        # top-level declaration of its unit, ``f_package_decl`` is the
+        # canonical part and the name is the same as
+        # ``decl.p_defining_name.text``.
+        pkg = decl.f_package_decl
+        name = pkg.f_package_name.text if pkg and pkg.f_package_name \
+            else decl.p_defining_name.text
+
+        signode += N.desc_annotation('generic package ', 'generic package ')
+        signode += N.desc_name(name, name)
 
     def handle_subp_inst(self, decl, node, signode, annotations):
         # type: (lal.PackageRenamingDecl, N.desc, N.desc_signature) -> None
