@@ -487,8 +487,34 @@ class GenerateDoc(lal.App):
                         # this.
                         pass
                 else:
-                    for comp in decl.p_discriminants_list():
-                        comps[comp] = set()
+                    # Defensive: libadalang 26.0.0's
+                    # `ProtectedTypeDecl.p_discriminants_list` returns
+                    # a null access (then wrapped as a libadalang
+                    # `PropertyError` with the message
+                    # "dereferencing a null access") for protected
+                    # types that have no explicit discriminants.
+                    # The reproducer is
+                    # `vulkan-callback_marshallers.ads:58:5-66:21`,
+                    # which defines a parameterless protected
+                    # type inside a `private generic` package. laldoc
+                    # used to call this property directly; the null
+                    # result then crashed the whole laldoc run.
+                    # Treat the empty case (None or PropertyError)
+                    # as the "no discriminants" case and keep going.
+                    # This defensive branch is portable: when the
+                    # libadalang bug is fixed upstream and the
+                    # property returns an empty list, the
+                    # for-loop simply does not execute, which is the
+                    # correct behaviour. The reproducer will start
+                    # emitting a discriminator list again only when
+                    # the libadalang fix lands.
+                    try:
+                        discriminants = decl.p_discriminants_list()
+                    except lal.PropertyError:
+                        discriminants = None
+                    if discriminants is not None:
+                        for comp in discriminants:
+                            comps[comp] = set()
 
                 # Emit components
                 for comp, discrs in comps.items():

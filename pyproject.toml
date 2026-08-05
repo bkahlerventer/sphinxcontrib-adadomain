@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,7 +25,36 @@ classifiers=[
     'Topic :: Documentation',
     'Topic :: Utilities',
 ]
+dependencies = [
+    # setuptools is required at runtime because some downstream
+    # tooling (Sphinx's own extension loader, ``pkg_resources``-based
+    # namespace helpers in older plugins) still imports it. ``setuptools``
+    # ships with ``pkg_resources``; on Python 3.12+ where setuptools is
+    # no longer installed by default, this declaration ensures those
+    # imports resolve. setuptools is a transitive dep of Sphinx anyway,
+    # so this is rarely a fresh install.
+    'setuptools',
+    # sphinxcontrib/__init__.py is now an empty PEP 420 namespace
+    # package, so setuptools alone is not enough; we still need the
+    # actual sphinx/docutils stack to render Ada directives.
+    'sphinx>=9.0',
+    'docutils>=0.21',
+]
 
+# ``laldoc`` is **not** an external dependency. It is a vendored
+# subpackage of this project: see ``./laldoc/`` and the
+# ``laldoc-wheel`` Makefile target. setuptools installs it as part of
+# the ``sphinxcontrib-adadomain`` distribution via the ``packages``
+# list below; no separate ``pip install laldoc`` is needed.
+#
+# The ``laldoc`` Python package lives at ``laldoc/laldoc/__init__.py``
+# (a one-level-deep layout). ``package-dir`` maps the package name to
+# that source directory so setuptools finds it.
+#
+# (If laldoc is ever published independently to PyPI, switch back
+# to ``dependencies = ['laldoc>=0.1']`` here. The vendoring pre-dates
+# any such publication.)
 [tool.setuptools]
-packages = ["sphinxcontrib"]
+packages = ["sphinxcontrib", "laldoc"]
+package-dir = { laldoc = "laldoc/laldoc" }
 py-modules = ['__init__']

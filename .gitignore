@@ -3,3 +3,8 @@ __pycache__
 build
 out
 wheels
+
+# Per-clone backup of upstream boilerplate replaced in
+# sphinxcontrib/__init__.py. Not source; preserved locally for
+# rollback. Do not commit.
+sphinxcontrib/__init__.py.upstream-bak
