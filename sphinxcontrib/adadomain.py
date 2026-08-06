@@ -186,6 +186,12 @@ class AdaObject(ObjectDescription):
             names=("component_clause", "comp_clause"),
         ),
         Field(
+            "discriminant_constraint",
+            label=_("Discriminant constraint"),
+            has_arg=False,
+            names=("discriminant_constraint", "discr_constraint"),
+        ),
+        Field(
             "formal_kind",
             label=_("Formal kind"),
             has_arg=False,

@@ -2199,7 +2199,46 @@ class GenerateDoc(lal.App):
                             Set[Tuple[lal.DiscriminantValues]]] = {}
 
                 if decl.p_is_access_type():
-                    pass
+                    # Access types have no components to walk,
+                    # but they MAY carry a discriminant
+                    # constraint (``type A is access all R (D
+                    # => 0);``). libadalang 26.0.0 has a known
+                    # null-deref bug on
+                    # ``p_discriminant_constraints`` when the
+                    # constraint is non-empty -- it raises
+                    # ``PropertyError: dereferencing a null
+                    # access`` instead of returning the list.
+                    # We avoid the property entirely and
+                    # recover the constraint text directly from
+                    # the ``SubtypeIndication`` node, which
+                    # works on every version. A blank line
+                    # before the field flips docutils to
+                    # body-field-parsing.
+                    try:
+                        type_def = decl.f_type_def
+                        si = (
+                            type_def.f_subtype_indication
+                            if type_def and hasattr(
+                                type_def, 'f_subtype_indication'
+                            ) else None
+                        )
+                        if (
+                            si is not None
+                            and si.f_constraint is not None
+                        ):
+                            constraint_text = strip_ws(
+                                si.f_constraint.text
+                            )
+                            if constraint_text:
+                                self.add_lines([''])
+                                self.add_lines([
+                                    f":discriminant_constraint: "
+                                    f"``{constraint_text}``"
+                                ])
+                    except (
+                        lal.PropertyError, AttributeError
+                    ):
+                        pass
                 elif decl.p_is_record_type():
                     try:
                         for shape in decl.p_shapes():
