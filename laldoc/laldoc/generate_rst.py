@@ -86,6 +86,16 @@ class GenerateDoc(lal.App):
     # across decls.
     _leading_pragmas: List[lal.PragmaNode]
 
+    # ``_leading_pragmas_snapshot`` is set just before
+    # ``handle_entity`` is called and is read by
+    # ``_emit_pragma_directives`` AFTER
+    # ``_emit_pragmas_body_field`` has cleared
+    # ``_leading_pragmas``. Each leading pragma then gets its
+    # own ``.. ada:pragma::`` directive. The snapshot is a
+    # shallow copy so the body-field emit's clear cannot
+    # affect the per-pragma directive emit.
+    _leading_pragmas_snapshot: List[lal.PragmaNode]
+
     # Pragmas whose semantics are also exposed as aspects on the same
     # entity. When a pragma in this set appears as a leading pragma,
     # it is documented under the corresponding aspect field rather
@@ -228,6 +238,7 @@ class GenerateDoc(lal.App):
         self._indent = 0
         self._package_nesting_level = 0
         self._leading_pragmas = []
+        self._leading_pragmas_snapshot = []
 
         os.makedirs(self.args.output_dir, exist_ok=True)
 
@@ -551,6 +562,7 @@ class GenerateDoc(lal.App):
             self._leading_pragmas = list(
                 pragmas_by_decl_id.get(id(decl), [])
             )
+            self._leading_pragmas_snapshot = list(self._leading_pragmas)
 
             _, annotations = self.get_documentation(decl)
 
@@ -633,9 +645,16 @@ class GenerateDoc(lal.App):
                 # associated-decls loop below. All three sites must
                 # agree because ``handle_entity`` consumes the slot
                 # via ``_emit_leading_pragmas_field``.
-                self._leading_pragmas = list(
+                pragmas_for_decl = list(
                     pragmas_by_decl_id.get(id(decl), [])
                 )
+                self._leading_pragmas = pragmas_for_decl
+                # Snapshot before the body-field emit clears it;
+                # ``_emit_pragma_directives`` reads from the
+                # snapshot so each leading pragma also gets its own
+                # ``.. ada:pragma::`` directive alongside the
+                # ``:pragmas:`` body field.
+                self._leading_pragmas_snapshot = list(pragmas_for_decl)
                 self.handle_entity(decl)
                 with self.indent():
                     for assoc_decls in associated_decls[decl]:
@@ -643,6 +662,9 @@ class GenerateDoc(lal.App):
                         # ``handle_entity`` sees the correct list.
                         self._leading_pragmas = list(
                             pragmas_by_decl_id.get(id(assoc_decls), [])
+                        )
+                        self._leading_pragmas_snapshot = list(
+                            self._leading_pragmas
                         )
                         self.handle_entity(assoc_decls)
 
@@ -706,6 +728,7 @@ class GenerateDoc(lal.App):
             self._leading_pragmas = list(
                 pragmas_by_decl_id.get(id(decl), [])
             )
+            self._leading_pragmas_snapshot = list(self._leading_pragmas)
             handle_decl(decl)
         self._package_nesting_level -= 1
 
@@ -761,6 +784,11 @@ class GenerateDoc(lal.App):
             self._emit_spark_mode_field(decl)
             # Walk the protected body.
             self._emit_protected_body(decl)
+        # Drop back to parent indent and emit one
+        # ``.. ada:aspect::`` / ``.. ada:pragma::`` per aspect
+        # / pragma on the protected type itself.
+        self._emit_aspect_directives(decl)
+        self._emit_pragma_directives(decl)
 
     def _emit_protected_body(self, decl: lal.ProtectedTypeDecl) -> None:
         """
@@ -1196,6 +1224,109 @@ class GenerateDoc(lal.App):
             else:
                 self.add_lines([f":pragmas: ``pragma {pname};``"])
 
+    def _emit_aspect_directives(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit one ``.. ada:aspect::`` directive per aspect on
+        ``decl``. Each aspect becomes a top-level cross-reference
+        target in the Ada domain, which lets readers link to a
+        specific aspect (e.g. ``:ada:aspect:`Pre```) and which
+        adds the aspect to the global object index. The aspect
+        body field emitted by ``_emit_aspects_body_field`` is
+        unchanged; this is an additive emit that runs alongside
+        it.
+
+        Aspects are only emitted on subprograms, types, and
+        objects — the same scope as ``_emit_aspects_body_field``.
+        Aspects that are recognised as an aspect (vs. a pragma)
+        on the same entity are emitted as aspects; the pragma
+        emit already skips these to avoid duplication.
+        """
+        if not isinstance(decl, lal.BasicSubpDecl) and \
+                not isinstance(decl, lal.BaseTypeDecl) and \
+                not isinstance(decl, lal.ObjectDecl):
+            return
+        if not decl.f_aspects:
+            return
+        target_fqn = decl.p_fully_qualified_name
+        for a in decl.f_aspects.f_aspect_assocs:
+            asp_name = a.f_id.text if a.f_id and a.f_id.text else None
+            if not asp_name:
+                continue
+            value = strip_ws(a.f_expr.text) if a.f_expr else ""
+            sig = f"{asp_name} => {value}" if value else asp_name
+            self.add_lines([f".. ada:aspect:: {sig} on {target_fqn}"])
+
+    def _emit_pragma_directives(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit one ``.. ada:pragma::`` directive per leading pragma
+        on ``decl``. Like ``_emit_aspect_directives`` this is an
+        additive emit alongside the existing ``:pragmas:`` body
+        field; the difference is that each pragma becomes a
+        top-level cross-reference target.
+
+        The ``self._leading_pragmas`` slot is consumed (cleared)
+        by ``_emit_pragmas_body_field``; callers that want
+        both the body field and the per-pragma directive must
+        call this method BEFORE ``_emit_pragmas_body_field``,
+        or pass an explicit pragmas list. The handler loops in
+        ``handle_entity`` already call this AFTER
+        ``_emit_pragmas_body_field`` for the aspect path, so
+        pragmas are read here directly from
+        ``self._leading_pragmas`` even though the body-field
+        emit cleared them; the workaround is that the partition
+        pass at the top of ``handle_package`` populates the
+        per-decl map and ``handle_decl`` re-stores the pragmas
+        into ``self._leading_pragmas`` immediately before
+        calling ``handle_entity``. The catch is timing: by the
+        time the per-pragma directive emit runs, the slot has
+        already been cleared by the body-field emit. We
+        therefore snapshot the pragmas at the start of the
+        handler loop and pass them through.
+        """
+        # ``self._leading_pragmas_snapshot`` is set by the
+        # handler loops before the body-field emit runs.
+        pragmas = getattr(self, '_leading_pragmas_snapshot', None)
+        if not pragmas:
+            return
+        # Pre-compute which aspect names are present so we can
+        # skip pragmas whose semantics duplicate an aspect.
+        aspect_names_present: Set[str] = set()
+        if decl.f_aspects:
+            for a in decl.f_aspects.f_aspect_assocs:
+                if a.f_id and a.f_id.text:
+                    aspect_names_present.add(a.f_id.text)
+        for p in pragmas:
+            pname = p.f_id.text if p.f_id else None
+            if not pname:
+                continue
+            if pname in self._pragma_to_aspect_map:
+                aspect_name = self._pragma_to_aspect_map[pname]
+                if aspect_name in aspect_names_present:
+                    continue
+            if p.f_args and p.f_args.text:
+                self.add_lines(
+                    [f".. ada:pragma:: {pname} ({p.f_args.text})"]
+                )
+            else:
+                self.add_lines([f".. ada:pragma:: {pname}"])
+
+    def _emit_rep_clause_directives(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit one ``.. ada:rep_clause::`` directive per
+        representation clause on ``decl``. Each clause is the
+        verbatim ``for ... use ...`` text. Clauses were
+        collected by the partition pass at the top of
+        ``handle_package``.
+        """
+        rep_clauses_by_decl_id = getattr(
+            self, '_rep_clauses_by_decl_id', None
+        )
+        if rep_clauses_by_decl_id is None:
+            return
+        for kind, r in rep_clauses_by_decl_id.get(id(decl), []):
+            text = strip_ws(r.text)
+            self.add_lines([f".. ada:rep_clause:: {text}"])
+
     def handle_entity(self, decl: lal.BasicDecl):
 
         def make_profile(s: lal.BaseSubpSpec) -> str:
@@ -1301,16 +1432,14 @@ class GenerateDoc(lal.App):
                             tt = "?"
                         param_strs.append(f"{nm} : {tt}")
                     params = "({})".format("; ".join(param_strs))
-                # Emit as ``ada:procedure::`` with just the
-                # entry name and params; the ``ada_subp_sig_re``
-                # regex in sphinxcontrib.adadomain expects
-                # ``procedure Name`` not ``procedure entry Name``.
-                # The "entry" annotation is lost in this
-                # representation; readers see a procedure call
-                # inside the protected type's body, which is
-                # the closest Sphinx has to Ada's entry.
-                prof = f"procedure {entry_name}{params}"
-                subp_kind = 'procedure'
+                # Emit as ``ada:entry::`` so entries get
+                # their own objtype (``entry``) instead of
+                # being collapsed into ``procedure``. The new
+                # ``ada_entry_sig_re`` regex in
+                # sphinxcontrib.adadomain accepts the
+                # ``entry Name (params)`` shape.
+                prof = f"entry {entry_name}{params}"
+                subp_kind = 'entry'
             else:
                 prof = make_profile(subp_spec)
                 subp_kind = (
@@ -1375,6 +1504,13 @@ class GenerateDoc(lal.App):
             with self.indent():
                 self._emit_aspects_body_field(decl)
                 self._emit_spark_mode_field(decl)
+
+            # Drop back to parent indent and emit one
+            # ``.. ada:aspect::`` per aspect and one
+            # ``.. ada:pragma::`` per leading pragma, so each
+            # becomes a top-level cross-reference target.
+            self._emit_aspect_directives(decl)
+            self._emit_pragma_directives(decl)
 
         elif isinstance(decl, lal.BaseTypeDecl):
             if isinstance(decl, lal.IncompleteTypeDecl):
@@ -1480,6 +1616,19 @@ class GenerateDoc(lal.App):
                         with self.indent():
                             self.add_lines(inner_doc)
 
+            # After the body-field emits close, drop back
+            # to the parent indent and emit one
+            # ``.. ada:aspect::`` directive per aspect on this
+            # type, plus one ``.. ada:pragma::`` per leading
+            # pragma, plus one ``.. ada:rep_clause::`` per
+            # representation clause. The body fields emitted
+            # above remain as compact summaries; the new
+            # directives give each aspect/pragma/clause its
+            # own cross-reference target.
+            self._emit_aspect_directives(decl)
+            self._emit_pragma_directives(decl)
+            self._emit_rep_clause_directives(decl)
+
         elif isinstance(decl, lal.ObjectDecl):
             default_expr = None
 
@@ -1532,17 +1681,23 @@ class GenerateDoc(lal.App):
                 self._emit_aspects_body_field(decl)
                 self._emit_spark_mode_field(decl)
 
+            # Drop back to parent indent and emit one
+            # ``.. ada:aspect::`` per aspect and one
+            # ``.. ada:pragma::`` per leading pragma, so each
+            # becomes a top-level cross-reference target.
+            self._emit_aspect_directives(decl)
+            self._emit_pragma_directives(decl)
+
         elif isinstance(decl, lal.NumberDecl):
             # NumberDecl is the Ada 2022 "number declaration"
             # shape: ``Twelve : constant := 12;``. It has no
             # type expression (the type is inferred from the
             # expression), only ``f_ids`` (the names list) and
-            # ``f_expr`` (the expression text). Reuse the
-            # ``ada:object::`` directive shape because the
-            # upstream adadomain handler treats it identically;
-            # readers see the same "Object declaration" label.
+            # ``f_expr`` (the expression text). Use the new
+            # ``ada:number::`` directive so constants get their
+            # own objtype, separate from ``ada:object``.
             descr = strip_ws(decl.text)
-            emit_directive(f".. ada:object:: {descr}")
+            emit_directive(f".. ada:number:: {descr}")
             with self.indent():
                 self.add_lines([''])
                 # ObjectDecl's ":objtype:" field has no analogue

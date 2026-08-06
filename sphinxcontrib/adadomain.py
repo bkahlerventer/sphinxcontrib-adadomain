@@ -73,6 +73,21 @@ logger = logging.getLogger(__name__)
 
 ada_type_sig_re = re.compile(r"^type\s+(\w+)", re.VERBOSE)
 ada_object_sig_re = re.compile(r"^(\w+)\s+(:\s+.+)", re.VERBOSE)
+ada_number_sig_re = re.compile(
+    r"^(\w+)\s+:\s+constant\s+(\S+)", re.VERBOSE
+)
+ada_entry_sig_re = re.compile(
+    r"^entry\s+(\w+)\s*(\(.*\))?\s*$", re.VERBOSE | re.DOTALL
+)
+ada_aspect_sig_re = re.compile(
+    r"^(\w+)(?:\s*=>\s*(.+?))?\s+on\s+(.+)$", re.VERBOSE | re.DOTALL
+)
+ada_pragma_sig_re = re.compile(
+    r"^(\w+)\s*(?:\((.*)\))?$", re.VERBOSE | re.DOTALL
+)
+ada_rep_clause_sig_re = re.compile(
+    r"^for\s+(.+?)\s+use\s+(.+)$", re.VERBOSE | re.DOTALL
+)
 ada_package_inst_sig_re = re.compile(
     r"^package\s+(\w+)\s+is\s+new\s+([\w\.]+)\s*", re.VERBOSE
 )
@@ -593,6 +608,164 @@ class AdaObject(ObjectDescription):
         signode += addnodes.desc_annotation(text=": exception")
         return name
 
+    def handle_number_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse an Ada number (named constant) declaration.
+
+        Signature shape: ``Name : constant Type`` or
+        ``Name : constant Type := value``. The ``: constant``
+        marker is mandatory; it is what makes this directive
+        different from ``ada:object``. Without ``constant`` the
+        consumer is signalling a variable, and ``ada:object`` is
+        the right directive.
+        """
+        name: Union[str, None] = None
+        descr: Union[str, None] = None
+
+        # libadalang-first: wrap in a package spec and parse
+        # with package_decl_rule. Walk into the public part and
+        # pick the first ObjectDecl whose ``f_is_constant`` is
+        # True. ``f_default_expr`` may be present (constants
+        # usually have one) but is not required.
+        if USE_LAL:
+            try:
+                tail = " := 0" if ":=" not in sig else ""
+                wrapped = f"package Wrap is {sig}{tail}; end Wrap;"
+                unit = lal_context.get_from_buffer(
+                    f"<ada_num_{id(self)}>",
+                    wrapped,
+                    rule=lal.GrammarRule.package_decl_rule,
+                )
+                pkg = unit.root
+                if (
+                    pkg is not None
+                    and not unit.diagnostics
+                    and pkg.f_public_part is not None
+                    and pkg.f_public_part.f_decls
+                ):
+                    decl = pkg.f_public_part.f_decls[0]
+                    if isinstance(decl, lal.ObjectDecl) and decl.f_ids:
+                        name = decl.f_ids[0].text
+                        if decl.f_type_expr is not None:
+                            type_text = decl.f_type_expr.text
+                            if decl.f_default_expr is not None:
+                                descr = (
+                                    f" : constant {type_text} "
+                                    f":= {decl.f_default_expr.text}"
+                                )
+                            else:
+                                descr = f" : constant {type_text}"
+            except Exception:
+                name = None
+                descr = None
+
+        # Regex fallback.
+        if name is None:
+            m = ada_number_sig_re.match(sig)
+            if m is None:
+                raise Exception(f"could not parse number sig {sig!r}")
+            name = m.group(1)
+            descr = sig[len(name):]
+
+        assert descr is not None
+        if not descr.startswith(" "):
+            descr = " " + descr
+
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_annotation(text=descr)
+        return name
+
+    def handle_entry_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a protected entry declaration.
+
+        Signature shape: ``entry Name`` optionally followed by
+        a parenthesised parameter list. The ``entry`` keyword
+        is required because the directive name is just ``entry``,
+        not ``ada:entry`` (the ``ada:`` prefix is added by Sphinx).
+        """
+        m = ada_entry_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse entry sig {sig!r}")
+        name, params = m.groups()
+        params = params or ""
+
+        signode += addnodes.desc_annotation(text="entry ")
+        signode += addnodes.desc_name(text=name)
+        if params:
+            signode += addnodes.desc_annotation(text=params)
+        return name
+
+    def handle_aspect_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse an aspect declaration.
+
+        Signature shape: ``Aspect_Name [=> value] on Target_FQN``.
+        The aspect name is the desc_name (so cross-references can
+        link to it), the value is the desc_annotation, and the
+        target is rendered as a :ada:ref: pending xref.
+        """
+        m = ada_aspect_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse aspect sig {sig!r}")
+        asp_name, asp_value, target = m.groups()
+
+        signode += addnodes.desc_name(text=asp_name)
+        if asp_value:
+            signode += addnodes.desc_annotation(
+                text=f" => {asp_value}"
+            )
+        signode += addnodes.desc_annotation(text=" on ")
+        # Render the target as a pending cross-reference so it
+        # links to the entity the aspect is attached to.
+        refnode = addnodes.pending_xref(
+            "",
+            refdomain="ada",
+            refexplicit=False,
+            reftype="ref",
+            reftarget=target,
+        )
+        refnode += addnodes.desc_name(text=target)
+        signode += refnode
+        return asp_name
+
+    def handle_pragma_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a pragma declaration.
+
+        Signature shape: ``Pragma_Name`` or
+        ``Pragma_Name (arg1, arg2, ...)``. The pragma name is
+        the desc_name; the args are the desc_annotation.
+        """
+        m = ada_pragma_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse pragma sig {sig!r}")
+        name, args = m.groups()
+
+        signode += addnodes.desc_annotation(text="pragma ")
+        signode += addnodes.desc_name(text=name)
+        if args:
+            signode += addnodes.desc_annotation(text=f" ({args})")
+        return name
+
+    def handle_rep_clause_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a representation clause.
+
+        Signature shape: ``for Target use body``. The full
+        clause text is rendered as a code-style annotation
+        after the target name.
+        """
+        m = ada_rep_clause_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse rep-clause sig {sig!r}")
+        target, body = m.groups()
+
+        signode += addnodes.desc_annotation(text="for ")
+        signode += addnodes.desc_name(text=target)
+        signode += addnodes.desc_annotation(text=f" use {body}")
+        return target
+
     def handle_package_inst(self, sig: str, signode: desc_signature) -> str:
         """
         Parse a generic package instantiation.
@@ -655,6 +828,16 @@ class AdaObject(ObjectDescription):
             ret = self.handle_type_sig(sig, signode)
         elif self.objtype == "object":
             ret = self.handle_object_sig(sig, signode)
+        elif self.objtype == "number":
+            ret = self.handle_number_sig(sig, signode)
+        elif self.objtype == "entry":
+            ret = self.handle_entry_sig(sig, signode)
+        elif self.objtype == "aspect":
+            ret = self.handle_aspect_sig(sig, signode)
+        elif self.objtype == "pragma":
+            ret = self.handle_pragma_sig(sig, signode)
+        elif self.objtype == "rep_clause":
+            ret = self.handle_rep_clause_sig(sig, signode)
         elif self.objtype == "exception":
             ret = self.handle_exception_sig(sig, signode)
         elif self.objtype == "generic-package-instantiation":
@@ -675,6 +858,16 @@ class AdaObject(ObjectDescription):
             return f"{name} (Ada procedure)"
         elif self.objtype == "type":
             return f"{name} (Ada type)"
+        elif self.objtype == "number":
+            return f"{name} (Ada constant)"
+        elif self.objtype == "entry":
+            return f"{name} (Ada entry)"
+        elif self.objtype == "aspect":
+            return f"{name} (Ada aspect)"
+        elif self.objtype == "pragma":
+            return f"{name} (Ada pragma)"
+        elif self.objtype == "rep_clause":
+            return f"{name} (Ada representation clause)"
         else:
             return ""
 
@@ -930,11 +1123,16 @@ class AdaDomain(Domain):
         "type": ObjType(_("type"), "type"),
         "package": ObjType(_("package"), "pkg"),
         "object": ObjType(_("object"), "obj"),
+        "number": ObjType(_("number"), "num"),
+        "entry": ObjType(_("entry"), "entry"),
         "exception": ObjType(_("exception"), "exc"),
         "generic_package": ObjType(_("generic package"), "genpkg"),
         "generic-package-instantiation": ObjType(
             _("generic package instantiation"), "geninst"
         ),
+        "aspect": ObjType(_("aspect"), "aspect"),
+        "pragma": ObjType(_("pragma"), "pragma"),
+        "rep_clause": ObjType(_("representation clause"), "repclause"),
     }
 
     directives = {
@@ -945,8 +1143,13 @@ class AdaDomain(Domain):
         "package": AdaObject,
         "generic_package": AdaObject,
         "object": AdaObject,
+        "number": AdaObject,
+        "entry": AdaObject,
         "exception": AdaObject,
         "generic-package-instantiation": AdaObject,
+        "aspect": AdaObject,
+        "pragma": AdaObject,
+        "rep_clause": AdaObject,
     }
     roles = {
         "func": AdaXRefRole(),
@@ -962,6 +1165,14 @@ class AdaDomain(Domain):
         # docutils rejects the role before Sphinx even gets to
         # dispatch.
         "any": AdaXRefRole(),
+        # Tier-1 objtypes get their own role names so authors can
+        # write ``:ada:aspect:`Inline`` etc. and have Sphinx route
+        # to the right lookup.
+        "num": AdaXRefRole(),
+        "entry": AdaXRefRole(),
+        "aspect": AdaXRefRole(),
+        "pragma": AdaXRefRole(),
+        "repclause": AdaXRefRole(),
     }
 
     # TODO: Is this useful?
