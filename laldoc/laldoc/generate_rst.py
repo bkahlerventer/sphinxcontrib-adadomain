@@ -729,16 +729,40 @@ class GenerateDoc(lal.App):
 
         self.add_lines([''] + pkg_doc + [''])
 
+        # A bare ``:Formals:`` label with body content of
+        # nested ``.. ada:`` directives is parsed by docutils
+        # as a field list whose body never closes, which
+        # produces the chain of
+        # ``Field list ends without a blank line; unexpected
+        # unindent`` warnings. Each formal is already tagged
+        # with a ``:formal_kind:`` body field that names its
+        # role, so the ``:Formals:`` section header is
+        # redundant. Emit the formals as direct children of
+        # the page at the package's base indent, with a
+        # leading callout so the reader still knows they are
+        # formals. ``.. attention::`` is the advisory box
+        # that both the HTML and Markdown Sphinx translators
+        # recognise (the generic ``.. admonition::`` is not
+        # handled by ``sphinx-markdown-builder`` 0.6.x; we
+        # use ``attention::`` rather than ``note::`` to give
+        # the formals block a stronger visual marker).
         if gen_package is not None:
-            self.add_lines([':Formals:'])
-            self.add_lines([''])
+            self.add_lines([""])
+            self.add_lines([
+                ".. attention::",
+                "",
+                "   The formals below are the type, object, "
+                "subprogram, and package parameters declared "
+                "by this generic package. Each carries a "
+                "``:formal_kind:`` body field naming its "
+                "category.",
+            ])
 
-            with self.indent():
-                for decl in gen_package.f_formal_part.f_decls:
-                    self._leading_pragmas = list(
-                        pragmas_by_decl_id.get(id(decl), [])
-                    )
-                    handle_decl(decl)
+            for decl in gen_package.f_formal_part.f_decls:
+                self._leading_pragmas = list(
+                    pragmas_by_decl_id.get(id(decl), [])
+                )
+                handle_decl(decl)
 
         # Go through all entities to generate their documentation.
         # We re-set ``self._leading_pragmas`` before each call so the
@@ -2322,19 +2346,62 @@ class GenerateDoc(lal.App):
                     inner_doc, annots = self.get_documentation(comp)
                     for dn in comp.p_defining_names:
                         formal_type = comp.p_formal_type()
-                        if formal_type.is_a(lal.AnonymousTypeDecl):
-                            tn = "``{}``".format(
-                                formal_type.text
-                            )
-                        else:
-                            tn = comp.p_formal_type().p_fully_qualified_name
                         comp_kind = (
                             "discriminant" if comp.is_a(lal.DiscriminantSpec)
                             else "component"
                         )
-                        self.add_string(f":{comp_kind} {tn} {dn.text}:")
-                        with self.indent():
-                            self.add_lines(inner_doc)
+                        # Multi-line component source text (anonymous
+                        # access types like ``not null access
+                        # function(...)``) cannot be embedded inside
+                        # an inline-literal field body: docutils
+                        # would keep scanning past the first ``;`` for
+                        # the closing `` `` `` and emit
+                        # ``Inline literal start-string without
+                        # end-string`` plus the downstream
+                        # ``Field list ends without a blank line``
+                        # warnings. Emit the field with the name
+                        # only, then a sibling ``.. code-block::
+                        # ada`` so the multi-line source renders as
+                        # a literal code block, which Sphinx
+                        # accepts. Single-line types (named or
+                        # anonymous) keep the inline-literal shape
+                        # so cross-references via ``bodyrolename`` in
+                        # the Ada domain still resolve.
+                        if (
+                            formal_type is not None
+                            and formal_type.is_a(lal.AnonymousTypeDecl)
+                            and "\n" in formal_type.text
+                        ):
+                            self.add_string(
+                                f":{comp_kind} {dn.text}:"
+                            )
+                            with self.indent():
+                                self.add_lines([""])
+                                self.add_string(
+                                    ".. code-block:: ada"
+                                )
+                                with self.indent():
+                                    self.add_lines(
+                                        [""] + formal_type.text.splitlines()
+                                    )
+                                self.add_lines(inner_doc)
+                        else:
+                            if (
+                                formal_type is not None
+                                and formal_type.is_a(lal.AnonymousTypeDecl)
+                            ):
+                                tn = "``{}``".format(formal_type.text)
+                            elif formal_type is not None:
+                                tn = (
+                                    formal_type.p_fully_qualified_name
+                                )
+                            else:
+                                tn = "?"
+                            self.add_string(
+                                f":{comp_kind} {tn} {dn.text}:"
+                            )
+                            with self.indent():
+                                self.add_lines(inner_doc)
 
                 # Emit any ``case ... is ... end case`` block
                 # as a ``:variant_part:`` body field with one
@@ -2523,11 +2590,23 @@ class GenerateDoc(lal.App):
                 kind = "object"
             elif isinstance(inner, lal.BasicSubpDecl):
                 kind = "subprogram"
-            elif isinstance(inner, lal.PackageDecl) or \
-                    isinstance(inner, lal.BasePackageDecl):
+            elif (
+                isinstance(inner, lal.PackageDecl)
+                or isinstance(inner, lal.BasePackageDecl)
+                # ``with package T is new Some_Template(<>);``
+                # formal: ``inner`` is the
+                # ``GenericPackageInstantiation`` itself, not a
+                # ``PackageDecl``. Surface it as ``kind: package``
+                # so the formal_kind tag matches its role.
+                or isinstance(inner, lal.GenericPackageInstantiation)
+            ):
                 kind = "package"
             self.add_lines([''])
             self.add_lines([f":formal_kind: {kind}"])
+            # Blank line closes the :formal_kind: field so the
+            # formal's own ``.. ada:`` directive is parsed as a
+            # sibling, not as a continuation of the field body.
+            self.add_lines([''])
             self.handle_entity(inner)
             return
         else:

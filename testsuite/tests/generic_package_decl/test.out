@@ -11,18 +11,21 @@ Pkg
 
     Element package documentation.
 
-    :Formals:
+
+    .. attention::
+
+       The formals below are the type, object, subprogram, and package parameters declared by this generic package. Each carries a ``:formal_kind:`` body field naming its category.
+
+    :formal_kind: type
+
+    .. ada:type:: type T
+        :package: Pkg.Element
+
+        :spark_mode: ``Off``
 
 
-        :formal_kind: type
-        .. ada:type:: type T
-            :package: Pkg.Element
 
-            :spark_mode: ``Off``
-
-
-
-            This type is private.
+        This type is private.
 
     .. ada:procedure:: procedure Set (E : Pkg.Element.T)
         :package: Pkg.Element

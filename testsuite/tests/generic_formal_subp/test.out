@@ -7,22 +7,26 @@ Pkg
 .. ada:generic_package:: Pkg
 
 
-:Formals:
+
+.. attention::
+
+   The formals below are the type, object, subprogram, and package parameters declared by this generic package. Each carries a ``:formal_kind:`` body field naming its category.
+
+:formal_kind: type
+
+.. ada:type:: type F
+    :package: Pkg
+
+    :spark_mode: ``Off``
 
 
-    :formal_kind: type
-    .. ada:type:: type F
-        :package: Pkg
-
-        :spark_mode: ``Off``
 
 
 
+:formal_kind: subprogram
 
+.. ada:function:: function Op (X : Pkg.F) return Standard.Integer
+    :package: Pkg
 
-    :formal_kind: subprogram
-    .. ada:function:: function Op (X : Pkg.F) return Standard.Integer
-        :package: Pkg
-
-        :spark_mode: ``Off``
+    :spark_mode: ``Off``
 
