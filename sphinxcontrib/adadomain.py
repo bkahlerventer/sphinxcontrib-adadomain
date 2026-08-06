@@ -180,6 +180,12 @@ class AdaObject(ObjectDescription):
             names=("representation", "repr"),
         ),
         Field(
+            "component_clause",
+            label=_("Component clause"),
+            has_arg=False,
+            names=("component_clause", "comp_clause"),
+        ),
+        Field(
             "formal_kind",
             label=_("Formal kind"),
             has_arg=False,

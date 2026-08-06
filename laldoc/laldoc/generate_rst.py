@@ -1145,6 +1145,95 @@ class GenerateDoc(lal.App):
                 [f":representation: ``{collapsed};``"]
             )
 
+    def _emit_component_clauses(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit one ``:component_clause:`` body field per
+        ``ComponentClause`` inside every ``RecordRepClause``
+        attached to ``decl``. The whole-clause summary that
+        ``_emit_representation_clauses`` produces collapses
+        all component clauses into a single paragraph (e.g.
+        ``for Buffer_T use record A at 0 range 0 .. 31; B at
+        4 range 0 .. 31; end record;``). That compact view
+        hides the C-layout details most relevant to readers
+        of a binding: which record field sits at which byte
+        offset and which bit range. This helper surfaces
+        each ``ComponentClause`` as its own labeled field
+        so the per-component layout is visible at a glance.
+
+        Output shape: one ``:component_clause:`` line per
+        ``ComponentClause``. The field body is the
+        ``Name at <pos> range <first> .. <last>`` source
+        text, collapsed to a single paragraph. ``others``
+        and ``*`` ranges (rare; e.g. ``A at 0 range *``)
+        are emitted verbatim.
+
+        No-op when ``decl`` has no record rep clauses, when
+        the record rep clause has no ``ComponentClause``
+        children, or when the libadalang AST walk fails
+        defensively (``PropertyError`` on partial ASTs).
+
+        The blank line before the first emitted field flips
+        docutils from option-parsing to body-field-parsing
+        (Pitfall #0b in the Sphinx Ada-docs pitfall).
+        """
+        rep_clauses_by_decl_id = getattr(
+            self, '_rep_clauses_by_decl_id', None
+        )
+        if rep_clauses_by_decl_id is None:
+            return
+        emitted_any = False
+        for kind, r in rep_clauses_by_decl_id.get(id(decl), []):
+            # ``f_components`` on a RecordRepClause is an
+            # ``AdaNodeList`` of ``ComponentClause`` nodes.
+            # We iterate defensively in case libadalang
+            # raises ``PropertyError`` on a malformed AST.
+            try:
+                clauses = r.f_components
+            except (lal.PropertyError, AttributeError):
+                continue
+            if clauses is None:
+                continue
+            for child in clauses:
+                if child is None or not child.is_a(
+                    lal.ComponentClause
+                ):
+                    continue
+                # ``f_id`` is the component identifier;
+                # ``f_position`` is the byte offset; ``f_range``
+                # is the bit range. All three are simple
+                # source-text nodes; we concatenate their text
+                # in the same shape as the source.
+                try:
+                    nm = (
+                        child.f_id.text
+                        if child.f_id and child.f_id.text
+                        else "?"
+                    )
+                    pos = (
+                        child.f_position.text
+                        if child.f_position
+                        else "?"
+                    )
+                    rng = (
+                        child.f_range.text
+                        if child.f_range
+                        else "?"
+                    )
+                except (lal.PropertyError, AttributeError):
+                    continue
+                # The ``f_range`` text already starts with the
+                # ``range`` keyword (``range 0 .. 31`` / ``range
+                # *``), so the assembled source shape is
+                # ``Name at Pos range First .. Last`` without
+                # a doubled ``range``.
+                line = f"{nm} at {pos} {rng}"
+                if not emitted_any:
+                    # Flip docutils from option-parsing to
+                    # body-field-parsing with a blank line.
+                    self.add_lines([''])
+                    emitted_any = True
+                self.add_lines([f":component_clause: ``{line}``"])
+
     def _emit_aspects_body_field(self, decl: lal.BasicDecl) -> None:
         """
         Emit contract / typing / optimization aspects as Sphinx
@@ -2093,6 +2182,14 @@ class GenerateDoc(lal.App):
                 # with this decl in the trailing/leading partition
                 # pass at the top of ``handle_package``.
                 self._emit_representation_clauses(decl)
+                # Per-component breakdown of any
+                # ``RecordRepClause``'s ``ComponentClause``
+                # children. Surfaces each layout line as its
+                # own labeled body field so readers can see
+                # which record field sits at which byte
+                # offset and bit range without having to
+                # parse the collapsed whole-clause text.
+                self._emit_component_clauses(decl)
 
             with self.indent():
                 self.add_lines([''])
