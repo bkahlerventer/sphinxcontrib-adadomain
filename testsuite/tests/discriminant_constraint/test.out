@@ -10,6 +10,7 @@ Pkg
 
     :spark_mode: ``Off``
 
+
     :discriminant Standard.Integer D:
     :component Standard.Integer A:
 
@@ -18,6 +19,7 @@ Pkg
     :package: Pkg
 
     :spark_mode: ``Off``
+
 
 
     :discriminant_constraint: ``(D => 0)``

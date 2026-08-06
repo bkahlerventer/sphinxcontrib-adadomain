@@ -9,11 +9,13 @@ Pkg
 
 :Formals:
 
+
     :formal_kind: type
     .. ada:type:: type F
         :package: Pkg
 
         :spark_mode: ``Off``
+
 
 
 

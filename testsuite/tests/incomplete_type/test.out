@@ -14,10 +14,12 @@ Pkg
 
 
 
+
 .. ada:type:: type Forward
     :package: Pkg
 
     :spark_mode: ``Off``
+
 
     :component Pkg.Forward_Ptr Next:
 

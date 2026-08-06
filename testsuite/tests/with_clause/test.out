@@ -7,7 +7,7 @@ Pkg
 :with: ``with Ada.Text_IO;``
 :with: ``use Ada.Text_IO;``
 
-.. ada:with_clause:: with Ada.Text_IO on Pkg
+    .. ada:with_clause:: with Ada.Text_IO on Pkg
 
 
 .. ada:procedure:: procedure Hello

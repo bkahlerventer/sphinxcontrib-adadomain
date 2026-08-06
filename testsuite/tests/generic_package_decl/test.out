@@ -13,11 +13,13 @@ Pkg
 
     :Formals:
 
+
         :formal_kind: type
         .. ada:type:: type T
             :package: Pkg.Element
 
             :spark_mode: ``Off``
+
 
 
             This type is private.

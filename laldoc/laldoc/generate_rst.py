@@ -524,9 +524,8 @@ class GenerateDoc(lal.App):
             elif decls:
                 pd, p_lead = decls_with_pragmas[0]
                 decls_with_pragmas[0] = (pd, p_lead + [p])
-            # else: pragma at the start of the package with no
-            # following decl; dropped on the floor (it would
-            # document itself).
+            # A pragma after the final declaration already maps to
+            # ``decls[-1]`` through the ``k > 0`` branch above.
 
         # Per-decl map keyed by ``id(decl)``. We need this map
         # because the outer loop below collects all decls into
@@ -732,6 +731,7 @@ class GenerateDoc(lal.App):
 
         if gen_package is not None:
             self.add_lines([':Formals:'])
+            self.add_lines([''])
 
             with self.indent():
                 for decl in gen_package.f_formal_part.f_decls:
@@ -807,6 +807,9 @@ class GenerateDoc(lal.App):
                 self._emit_pragmas_body_field(decl)
             self._emit_aspects_body_field(decl)
             self._emit_spark_mode_field(decl)
+            # A blank line terminates body fields before nested
+            # directives emitted by the protected-body walk.
+            self.add_lines([''])
             # Walk the protected body.
             self._emit_protected_body(decl)
         # Drop back to parent indent and emit one
@@ -961,10 +964,10 @@ class GenerateDoc(lal.App):
             names_text = ", ".join(
                 i.text for i in comp.f_ids
             )
-        type_text = comp.f_component_def.text if \
+        type_text = strip_ws(comp.f_component_def.text) if \
             comp.f_component_def else "?"
         if comp.f_default_expr:
-            type_text += " := " + comp.f_default_expr.text
+            type_text += " := " + strip_ws(comp.f_default_expr.text)
         self.add_lines([f":component: ``{type_text}``  {names_text}"])
 
     def _fall_through_to_default_handler(self, decl: lal.BasicDecl) -> None:
@@ -1333,7 +1336,7 @@ class GenerateDoc(lal.App):
             if not name or name not in aspect_groups:
                 continue
             group_name, field_marker = aspect_groups[name]
-            expr = a.f_expr.text if a.f_expr else ""
+            expr = strip_ws(a.f_expr.text) if a.f_expr else name
             groups[group_name].append((field_marker, expr))
         # Skip the emit if no group has any aspect.
         if not any(groups.values()):
@@ -1419,24 +1422,26 @@ class GenerateDoc(lal.App):
             assocs = expr.f_assocs
             if assocs is None:
                 continue
-            for assoc in assocs:
-                # Build the case key text. AlternativesList
-                # has f_items (for multiple alternatives) or
-                # a single child for ``others``.
-                key_text = ""
-                if assoc.f_designators is not None:
-                    key_text = strip_ws(assoc.f_designators.text)
-                # Build the result text.
-                result_text = (
-                    strip_ws(assoc.f_r_expr.text)
-                    if assoc.f_r_expr else ""
-                )
-                # Format as ``key => result``.
-                case_text = f"{key_text} => {result_text}"
-                self.add_lines(
-                    [f".. ada:aspect:: Contract_Cases => {case_text}"
-                     f" on {target_fqn}"]
-                )
+            self.add_lines([''])
+            with self.indent():
+                for assoc in assocs:
+                    # Build the case key text. AlternativesList
+                    # has f_items (for multiple alternatives) or
+                    # a single child for ``others``.
+                    key_text = ""
+                    if assoc.f_designators is not None:
+                        key_text = strip_ws(assoc.f_designators.text)
+                    # Build the result text.
+                    result_text = (
+                        strip_ws(assoc.f_r_expr.text)
+                        if assoc.f_r_expr else ""
+                    )
+                    # Format as ``key => result``.
+                    case_text = f"{key_text} => {result_text}"
+                    self.add_lines(
+                        [f".. ada:aspect:: Contract_Cases => {case_text}"
+                         f" on {target_fqn}"]
+                    )
 
     def _emit_pragmas_body_field(self, decl: lal.BasicDecl) -> None:
         """
@@ -1545,17 +1550,19 @@ class GenerateDoc(lal.App):
         if not decl.f_aspects:
             return
         target_fqn = decl.p_fully_qualified_name
-        for a in decl.f_aspects.f_aspect_assocs:
-            asp_name = a.f_id.text if a.f_id and a.f_id.text else None
-            if not asp_name:
-                continue
-            # Contract_Cases gets per-case emission in
-            # ``_emit_contract_cases_structured``; skip here.
-            if asp_name == "Contract_Cases":
-                continue
-            value = strip_ws(a.f_expr.text) if a.f_expr else ""
-            sig = f"{asp_name} => {value}" if value else asp_name
-            self.add_lines([f".. ada:aspect:: {sig} on {target_fqn}"])
+        self.add_lines([''])
+        with self.indent():
+            for a in decl.f_aspects.f_aspect_assocs:
+                asp_name = a.f_id.text if a.f_id and a.f_id.text else None
+                if not asp_name:
+                    continue
+                # Contract_Cases gets per-case emission in
+                # ``_emit_contract_cases_structured``; skip here.
+                if asp_name == "Contract_Cases":
+                    continue
+                value = strip_ws(a.f_expr.text) if a.f_expr else ""
+                sig = f"{asp_name} => {value}" if value else asp_name
+                self.add_lines([f".. ada:aspect:: {sig} on {target_fqn}"])
 
     def _emit_pragma_directives(self, decl: lal.BasicDecl) -> None:
         """
@@ -1605,10 +1612,12 @@ class GenerateDoc(lal.App):
                 if aspect_name in aspect_names_present:
                     continue
             if p.f_args and p.f_args.text:
+                self.add_lines([''])
                 self.add_lines(
                     [f".. ada:pragma:: {pname} ({p.f_args.text})"]
                 )
             else:
+                self.add_lines([''])
                 self.add_lines([f".. ada:pragma:: {pname}"])
 
     def _emit_rep_clause_directives(self, decl: lal.BasicDecl) -> None:
@@ -1778,15 +1787,13 @@ class GenerateDoc(lal.App):
                         continue
                     seen.add(imports)
                     if not emitted:
-                        # Flip docutils out of
-                        # field-list-parsing mode before
-                        # emitting the first directive.
                         self.add_lines([''])
                         emitted = True
-                    self.add_lines(
-                        [f".. ada:with_clause:: with {imports}"
-                         f" on {owner_fqn}"]
-                    )
+                    with self.indent():
+                        self.add_lines(
+                            [f".. ada:with_clause:: with {imports}"
+                             f" on {owner_fqn}"]
+                        )
                 elif child.is_a(lal.UseClause):
                     collapsed = " ".join(
                         ln.strip() for ln in child.text.splitlines()
@@ -1801,10 +1808,11 @@ class GenerateDoc(lal.App):
                     if not emitted:
                         self.add_lines([''])
                         emitted = True
-                    self.add_lines(
-                        [f".. ada:with_clause:: use {imports}"
-                         f" on {owner_fqn}"]
-                    )
+                    with self.indent():
+                        self.add_lines(
+                            [f".. ada:with_clause:: use {imports}"
+                             f" on {owner_fqn}"]
+                        )
                 elif child.is_a(lal.AdaNodeList):
                     walk(child, depth + 1)
 
@@ -2146,9 +2154,6 @@ class GenerateDoc(lal.App):
             # becomes a top-level cross-reference target.
             self._emit_aspect_directives(decl)
             self._emit_pragma_directives(decl)
-            # For ``Contract_Cases`` aspects, emit one
-            # ``ada:aspect::`` directive per case so readers
-            # see each case individually and can link to it.
             self._emit_contract_cases_structured(decl)
 
         elif isinstance(decl, lal.BaseTypeDecl):
@@ -2186,8 +2191,7 @@ class GenerateDoc(lal.App):
             with self.indent():
                 self._emit_aspects_body_field(decl)
                 self._emit_spark_mode_field(decl)
-
-                # Emit C-struct layout representation clauses
+                self.add_lines([''])
                 # (``for T'Size use 32``, ``for T use record ...``
                 # with ``Component at ... range ...`` lines) as a
                 # Sphinx body field. The clauses were associated
@@ -2405,6 +2409,7 @@ class GenerateDoc(lal.App):
                 # land at the same indent as :objtype:.
                 self._emit_aspects_body_field(decl)
                 self._emit_spark_mode_field(decl)
+                self.add_lines([''])
 
             # Drop back to parent indent and emit one
             # ``.. ada:aspect::`` per aspect and one
@@ -2457,8 +2462,10 @@ class GenerateDoc(lal.App):
             # the rendered signature. The body's own declarations are
             # emitted as ordinary nested decls by the upstream walk.
             pkg = decl.f_package_decl
+            if pkg is None:
+                return
             name = (pkg.f_package_name.text
-                    if pkg and pkg.f_package_name
+                    if pkg.f_package_name
                     else decl.p_defining_name.text)
             emit_directive(f".. ada:generic_package:: {name}")
 
@@ -2507,6 +2514,8 @@ class GenerateDoc(lal.App):
             # type/object/subprogram directive but with a tag
             # above it indicating the formal's role.
             inner = decl.f_decl
+            if inner is None:
+                return
             kind = "unknown"
             if isinstance(inner, lal.BaseTypeDecl):
                 kind = "type"

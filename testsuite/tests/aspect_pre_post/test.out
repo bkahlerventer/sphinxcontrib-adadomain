@@ -13,7 +13,8 @@ Pkg
        :post: ``Check'Result >= 0``
 
     :spark_mode: ``Off``
-.. ada:aspect:: Pre => X > 0 on Pkg.Check
-.. ada:aspect:: Post => Check'Result >= 0 on Pkg.Check
+
+    .. ada:aspect:: Pre => X > 0 on Pkg.Check
+    .. ada:aspect:: Post => Check'Result >= 0 on Pkg.Check
 
     Pre and Post aspects on a function.

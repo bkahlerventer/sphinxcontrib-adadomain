@@ -10,6 +10,7 @@ Pkg
 
     :spark_mode: ``Off``
 
+
     Public operations:
         .. ada:function:: function Get  return Standard.Natural
             :package: Pkg.Counter
