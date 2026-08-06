@@ -690,6 +690,11 @@ class GenerateDoc(lal.App):
             if with_uses_lines:
                 self.add_lines([''])
                 self.add_lines(with_uses_lines)
+            # Emit one ``.. ada:with_clause::`` directive per
+            # ``with`` / ``use`` clause, so each becomes a
+            # top-level cross-reference target. The body field
+            # above remains as a compact summary.
+            self._emit_with_clause_directives(package_decl)
             # When the package is a thin generic template (the
             # caller passed ``gen_package``), also emit the
             # ``.. ada:generic_package::`` directive for the
@@ -798,6 +803,11 @@ class GenerateDoc(lal.App):
         fields under a private-section header. We do not recurse
         into nested protected types or nested packages; the
         current scope is one protected type.
+
+        If the body subprogram has an actual implementation (not
+        ``is null``) we emit a ``:body:`` body field with the
+        verbatim source text, so the reader sees the body
+        without having to open the ``.adb`` file.
         """
         definition = decl.f_definition
         if definition is None:
@@ -813,6 +823,18 @@ class GenerateDoc(lal.App):
                     self._leading_pragmas = []
                     self.handle_entity(sub)
                     self._leading_pragmas = []
+                    # If this is a subprogram with a real body,
+                    # resolve it via libadalang's ``p_body_part``
+                    # cross-file analysis and emit the body
+                    # source text as a ``:body:`` body field.
+                    # The ``:body:`` field must be at the same
+                    # indent as ``:package:``, which means we
+                    # need to close the indent that
+                    # ``handle_entity`` opened, then open it
+                    # again. ``add_lines`` does not flush, so
+                    # we buffer the body emit and place it
+                    # between indent() blocks.
+                    self._walk_subp_body(sub)
         private_part = definition.f_private_part
         if private_part:
             self.add_lines([''])
@@ -824,6 +846,86 @@ class GenerateDoc(lal.App):
                         # ``:component:`` fields, not as their
                         # own ``ada:type::`` directive.
                         self._emit_component_field(comp)
+
+    def _emit_subp_body_field(
+        self, body_text: str, subp_name: str
+    ) -> None:
+        """
+        Emit a ``:body:`` body field with the verbatim source
+        text of a subprogram body. Used by the protected-body
+        walker to render bodies that are not ``is null``. The
+        text is collapsed to a single line so the Sphinx Field
+        parser can read it as one paragraph. Multi-line bodies
+        are truncated to 200 characters with an ellipsis to
+        keep the rendered table compact; readers who need the
+        full text can open the ``.adb`` source file.
+        """
+        collapsed = " ".join(
+            ln.strip() for ln in body_text.splitlines()
+            if ln.strip()
+        )
+        if len(collapsed) > 200:
+            collapsed = collapsed[:197] + "..."
+        self.add_lines([f":body: ``{collapsed}``"])
+
+    def _walk_subp_body(
+        self,
+        sub_spec: lal.BasicSubpDecl,
+    ) -> None:
+        """
+        Resolve the body of ``sub_spec`` (a subprogram declared
+        inside a protected type spec) via libadalang's
+        cross-file analysis (``p_body_part``) and emit the body
+        source text as a ``:body:`` field. Skips ``is null``
+        bodies because the spec already tells the reader it's
+        null.
+
+        Silently no-ops if the body cannot be resolved (no
+        ``.adb`` file on disk, or the body is in a separate
+        package we cannot reach).
+
+        The ``:body:`` field must land at the SAME indent as
+        other body fields on the parent directive (e.g.
+        ``:package:``). ``handle_entity`` has already opened an
+        ``indent()`` for the subprogram's body fields, so the
+        current ``self._indent`` is one level too deep. We
+        decrement, emit, increment.
+        """
+        # Skip null bodies: ``is null`` is documented at the
+        # spec level by ``handle_entity`` (the ``:is_null:``
+        # body field).
+        if isinstance(sub_spec, lal.NullSubpDecl):
+            return
+        # ``p_body_part`` is libadalang's cross-file resolver.
+        # It is a method (must be called) that returns the
+        # corresponding ``SubpBody`` in the ``.adb`` file, or
+        # raises ``PropertyError`` if it cannot be found.
+        try:
+            body = sub_spec.p_body_part()
+        except lal.PropertyError:
+            return
+        except AttributeError:
+            return
+        if body is None:
+            return
+        name = sub_spec.p_defining_name.text if \
+            sub_spec.p_defining_name else "?"
+        # ``_walk_subp_body`` is invoked from
+        # ``_emit_protected_body`` AFTER ``handle_entity``
+        # has already closed its ``with self.indent()`` block.
+        # The current ``self._indent`` is one level too SHALLOW
+        # for the body field — it lands at the same level as
+        # the subprogram directive, not at the same level as
+        # the subprogram's other body fields (``:spark_mode:``
+        # etc.). We add one level so the ``:body:`` line lands
+        # at the correct body-field indent.
+        self._indent += 4
+        try:
+            self._emit_subp_body_field(body.text, name)
+        finally:
+            self._indent = max(0, self._indent - 4)
+
+
 
     def _emit_component_field(self, comp: lal.ComponentDecl) -> None:
         """
@@ -1149,6 +1251,84 @@ class GenerateDoc(lal.App):
             for field_marker, expr in groups[group_name]:
                 self.add_lines([f"   {field_marker} ``{expr}``"])
 
+    def _emit_contract_cases_structured(
+        self, decl: lal.BasicDecl
+    ) -> None:
+        """
+        Emit a structured rendering of the ``Contract_Cases``
+        aspect, if any. The body field emit above produces one
+        line ``:contract_cases: `` ...the whole expression... ````
+        which is dense and hard to read when there are many
+        cases. This emit walks each contract case individually
+        and emits it as a ``.. ada:aspect:: Contract_Cases on
+        <target>`` directive whose value is the single case
+        (e.g. ``when X > 0 => X'Result > 0``). Readers get one
+        aspect per case in the global object index, can link to
+        specific cases, and the rendered table is a readable
+        list.
+
+        Structure of the Contract_Cases expression in the AST:
+
+          Contract_Cases => ( KEY_1 => RESULT_1,
+                              KEY_2 => RESULT_2,
+                              others => RESULT_N );
+
+        The expression is an ``Aggregate`` whose ``f_assocs`` is
+        an ``AssocList`` of ``AggregateAssoc`` pairs. Each
+        ``AggregateAssoc`` carries:
+
+          - ``f_designators``: an ``AlternativesList`` for
+            non-trivial keys (``X > 0`` etc.) or a single
+            ``others`` identifier for the catch-all.
+          - ``f_r_expr``: the result expression.
+
+        We emit one ``ada:aspect::`` directive per case, using
+        the source text for both key and result. The existing
+        body field remains as a compact summary.
+        """
+        if not isinstance(decl, lal.BasicSubpDecl) and \
+                not isinstance(decl, lal.BaseTypeDecl) and \
+                not isinstance(decl, lal.ObjectDecl):
+            return
+        if not decl.f_aspects:
+            return
+        target_fqn = decl.p_fully_qualified_name
+        for a in decl.f_aspects.f_aspect_assocs:
+            name = a.f_id.text if a.f_id and a.f_id.text else None
+            if name != "Contract_Cases":
+                continue
+            expr = a.f_expr
+            # ``f_expr`` for ``Contract_Cases`` is an Aggregate.
+            # If the AST is malformed (parser couldn't build the
+            # aggregate), fall back to the verbatim source text
+            # so we never lose information.
+            if expr is None or not hasattr(expr, 'f_assocs'):
+                # Re-emit the original single-line summary
+                # already covered by the body field; nothing
+                # to add.
+                continue
+            assocs = expr.f_assocs
+            if assocs is None:
+                continue
+            for assoc in assocs:
+                # Build the case key text. AlternativesList
+                # has f_items (for multiple alternatives) or
+                # a single child for ``others``.
+                key_text = ""
+                if assoc.f_designators is not None:
+                    key_text = strip_ws(assoc.f_designators.text)
+                # Build the result text.
+                result_text = (
+                    strip_ws(assoc.f_r_expr.text)
+                    if assoc.f_r_expr else ""
+                )
+                # Format as ``key => result``.
+                case_text = f"{key_text} => {result_text}"
+                self.add_lines(
+                    [f".. ada:aspect:: Contract_Cases => {case_text}"
+                     f" on {target_fqn}"]
+                )
+
     def _emit_pragmas_body_field(self, decl: lal.BasicDecl) -> None:
         """
         Emit a ``:pragmas:`` Sphinx body field listing every
@@ -1240,6 +1420,14 @@ class GenerateDoc(lal.App):
         Aspects that are recognised as an aspect (vs. a pragma)
         on the same entity are emitted as aspects; the pragma
         emit already skips these to avoid duplication.
+
+        ``Contract_Cases`` is special: its expression is a
+        parenthesised aggregate of many cases, not a single
+        expression. ``_emit_contract_cases_structured`` walks
+        each case and emits a per-case ``ada:aspect::``
+        directive. We skip ``Contract_Cases`` here so the
+        reader sees one aspect per case rather than one mega
+        aspect containing the whole aggregate.
         """
         if not isinstance(decl, lal.BasicSubpDecl) and \
                 not isinstance(decl, lal.BaseTypeDecl) and \
@@ -1251,6 +1439,10 @@ class GenerateDoc(lal.App):
         for a in decl.f_aspects.f_aspect_assocs:
             asp_name = a.f_id.text if a.f_id and a.f_id.text else None
             if not asp_name:
+                continue
+            # Contract_Cases gets per-case emission in
+            # ``_emit_contract_cases_structured``; skip here.
+            if asp_name == "Contract_Cases":
                 continue
             value = strip_ws(a.f_expr.text) if a.f_expr else ""
             sig = f"{asp_name} => {value}" if value else asp_name
@@ -1326,6 +1518,86 @@ class GenerateDoc(lal.App):
         for kind, r in rep_clauses_by_decl_id.get(id(decl), []):
             text = strip_ws(r.text)
             self.add_lines([f".. ada:rep_clause:: {text}"])
+
+    def _emit_with_clause_directives(
+        self, package_decl: lal.BasePackageDecl
+    ) -> None:
+        """
+        Emit one ``.. ada:with_clause::`` directive per
+        ``with`` clause on the package. Each directive names the
+        imported package(s) so readers can link to specific
+        imports via ``:ada:withclause:`My_Package```.
+
+        ``with`` clauses are at the compilation-unit level
+        (the prelude), not on the ``PackageDecl`` itself, so
+        this is called from ``handle_package`` rather than
+        ``handle_entity``. ``UseClause`` (``use Foo;``) is
+        also emitted under the same directive since the role
+        is the same: a cross-reference to a known entity.
+
+        Emits a leading blank line so docutils cleanly exits
+        the field-list-parsing mode that the preceding
+        ``:with:`` body fields were in. Without the blank
+        line, docutils tries to keep parsing the
+        ``ada:with_clause`` directives as more field-list
+        entries and emits
+        ``Field list ends without a blank line; unexpected
+        unindent`` warnings.
+        """
+        unit = package_decl.unit
+        if unit is None or unit.root is None:
+            return
+        owner_fqn = package_decl.p_fully_qualified_name
+        seen: Set[str] = set()
+
+        def walk(node, depth: int = 0) -> None:
+            if depth > 1:
+                return
+            emitted = False
+            for child in node:
+                if child.is_a(lal.WithClause):
+                    collapsed = " ".join(
+                        ln.strip() for ln in child.text.splitlines()
+                        if ln.strip()
+                    )
+                    imports = collapsed.rstrip(';').strip()
+                    if imports.startswith("with "):
+                        imports = imports[5:].strip()
+                    if imports in seen:
+                        continue
+                    seen.add(imports)
+                    if not emitted:
+                        # Flip docutils out of
+                        # field-list-parsing mode before
+                        # emitting the first directive.
+                        self.add_lines([''])
+                        emitted = True
+                    self.add_lines(
+                        [f".. ada:with_clause:: with {imports}"
+                         f" on {owner_fqn}"]
+                    )
+                elif child.is_a(lal.UseClause):
+                    collapsed = " ".join(
+                        ln.strip() for ln in child.text.splitlines()
+                        if ln.strip()
+                    )
+                    imports = collapsed.rstrip(';').strip()
+                    if imports.startswith("use "):
+                        imports = imports[4:].strip()
+                    if imports in seen:
+                        continue
+                    seen.add(imports)
+                    if not emitted:
+                        self.add_lines([''])
+                        emitted = True
+                    self.add_lines(
+                        [f".. ada:with_clause:: use {imports}"
+                         f" on {owner_fqn}"]
+                    )
+                elif child.is_a(lal.AdaNodeList):
+                    walk(child, depth + 1)
+
+        walk(unit.root)
 
     def handle_entity(self, decl: lal.BasicDecl):
 
@@ -1511,6 +1783,10 @@ class GenerateDoc(lal.App):
             # becomes a top-level cross-reference target.
             self._emit_aspect_directives(decl)
             self._emit_pragma_directives(decl)
+            # For ``Contract_Cases`` aspects, emit one
+            # ``ada:aspect::`` directive per case so readers
+            # see each case individually and can link to it.
+            self._emit_contract_cases_structured(decl)
 
         elif isinstance(decl, lal.BaseTypeDecl):
             if isinstance(decl, lal.IncompleteTypeDecl):

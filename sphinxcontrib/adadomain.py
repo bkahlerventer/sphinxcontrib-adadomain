@@ -88,6 +88,9 @@ ada_pragma_sig_re = re.compile(
 ada_rep_clause_sig_re = re.compile(
     r"^for\s+(.+?)\s+use\s+(.+)$", re.VERBOSE | re.DOTALL
 )
+ada_with_clause_sig_re = re.compile(
+    r"^with\s+(.+?)\s+on\s+(.+)$", re.VERBOSE | re.DOTALL
+)
 ada_package_inst_sig_re = re.compile(
     r"^package\s+(\w+)\s+is\s+new\s+([\w\.]+)\s*", re.VERBOSE
 )
@@ -243,6 +246,12 @@ class AdaObject(ObjectDescription):
             label=_("Link name"),
             has_arg=False,
             names=("link_name",),
+        ),
+        Field(
+            "body",
+            label=_("Body"),
+            has_arg=False,
+            names=("body",),
         ),
         TypedField(
             "aspect",
@@ -766,6 +775,27 @@ class AdaObject(ObjectDescription):
         signode += addnodes.desc_annotation(text=f" use {body}")
         return target
 
+    def handle_with_clause_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a ``with`` clause cross-reference.
+
+        Signature shape: ``with <imported_pkg_list> on
+        <owning_pkg_fqn>``. The imported package names are the
+        desc_name (so each becomes a cross-reference target);
+        the owning package is the desc_annotation. Each
+        ``with`` clause on the source file emits one such
+        directive, so readers can link to specific imports.
+        """
+        m = ada_with_clause_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse with-clause sig {sig!r}")
+        imports, owner = m.groups()
+
+        signode += addnodes.desc_annotation(text="with ")
+        signode += addnodes.desc_name(text=imports)
+        signode += addnodes.desc_annotation(text=f" on {owner}")
+        return imports
+
     def handle_package_inst(self, sig: str, signode: desc_signature) -> str:
         """
         Parse a generic package instantiation.
@@ -838,6 +868,8 @@ class AdaObject(ObjectDescription):
             ret = self.handle_pragma_sig(sig, signode)
         elif self.objtype == "rep_clause":
             ret = self.handle_rep_clause_sig(sig, signode)
+        elif self.objtype == "with_clause":
+            ret = self.handle_with_clause_sig(sig, signode)
         elif self.objtype == "exception":
             ret = self.handle_exception_sig(sig, signode)
         elif self.objtype == "generic-package-instantiation":
@@ -868,6 +900,8 @@ class AdaObject(ObjectDescription):
             return f"{name} (Ada pragma)"
         elif self.objtype == "rep_clause":
             return f"{name} (Ada representation clause)"
+        elif self.objtype == "with_clause":
+            return f"{name} (Ada with clause)"
         else:
             return ""
 
@@ -1133,6 +1167,7 @@ class AdaDomain(Domain):
         "aspect": ObjType(_("aspect"), "aspect"),
         "pragma": ObjType(_("pragma"), "pragma"),
         "rep_clause": ObjType(_("representation clause"), "repclause"),
+        "with_clause": ObjType(_("with clause"), "withclause"),
     }
 
     directives = {
@@ -1150,6 +1185,7 @@ class AdaDomain(Domain):
         "aspect": AdaObject,
         "pragma": AdaObject,
         "rep_clause": AdaObject,
+        "with_clause": AdaObject,
     }
     roles = {
         "func": AdaXRefRole(),
@@ -1173,6 +1209,7 @@ class AdaDomain(Domain):
         "aspect": AdaXRefRole(),
         "pragma": AdaXRefRole(),
         "repclause": AdaXRefRole(),
+        "withclause": AdaXRefRole(),
     }
 
     # TODO: Is this useful?
