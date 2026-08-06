@@ -1527,6 +1527,108 @@ class GenerateDoc(lal.App):
             text = strip_ws(r.text)
             self.add_lines([f".. ada:rep_clause:: {text}"])
 
+    def _emit_variant_part_field(self, decl: lal.BasicDecl) -> None:
+        """
+        Emit a ``:variant_part:`` body field and one
+        ``:variant:`` body field per alternative for any
+        ``case ... is ... end case`` block inside a record type.
+
+        Variant parts live on the ``RecordDef`` as
+        ``f_components.f_variant_part`` (sibling of the
+        regular ``f_components`` list). The discriminant name
+        and each ``when ... => ...`` alternative's choices and
+        nested component declarations are surfaced as a Field
+        block.
+
+        The component emit earlier in the handler
+        (``handle_entity`` for ``BaseTypeDecl``) explicitly
+        skips components whose grand-parent is a
+        ``Variant`` (the ``ctx.is_a(lal.Variant)`` guard at
+        ``comps.setdefault``). That is correct: variant
+        components are documented under their parent
+        alternative here, not at the record level. So the
+        variant emit is the ONLY place where variant
+        components are visible to the reader.
+
+        No-op when ``decl`` is not a record type, when the
+        record has no variant part, or when the libadalang
+        AST cannot answer ``f_type_def.f_record_def``
+        (defensive: libadalang 26.0.0 raises ``PropertyError``
+        on synthetic / partial ASTs).
+        """
+        if not isinstance(decl, lal.BaseTypeDecl):
+            return
+        if not decl.p_is_record_type():
+            return
+        try:
+            type_def = decl.f_type_def
+        except (lal.PropertyError, AttributeError):
+            return
+        if not type_def or not type_def.is_a(lal.RecordTypeDef):
+            return
+        try:
+            record_def = type_def.f_record_def
+            comp_list = record_def.f_components
+            vp = comp_list.f_variant_part
+        except (lal.PropertyError, AttributeError):
+            return
+        if vp is None:
+            return
+        # The discriminant identifier is a single ``Id`` node
+        # whose ``text`` is the discriminant's source name
+        # (``D`` for ``case D is``). The VariantList node
+        # iterates as a sequence of ``Variant`` children.
+        discr_text = (
+            vp.f_discr_name.text if vp.f_discr_name else "?"
+        )
+        self.add_lines([f":variant_part: case {discr_text} is"])
+        with self.indent():
+            for variant in vp.f_variant:
+                # ``f_choices`` is an ``AlternativesList``
+                # whose ``text`` is the verbatim source
+                # (``0`` / ``1 | 2`` / ``others``). We collapse
+                # whitespace so the Field body is a single
+                # paragraph (Pitfall #11 in
+                # hermes-tool-usage-pitfalls: Sphinx Field
+                # bodies must be a single paragraph).
+                choices_text = strip_ws(
+                    variant.f_choices.text
+                ) if variant.f_choices else "?"
+                # Components inside a variant are listed
+                # under the alternative. ``f_components`` is a
+                # ``ComponentList`` whose ``f_components``
+                # field is the ``AdaNodeList`` of
+                # ``ComponentDecl`` nodes. The trailing
+                # ``NoneType`` is the (always-empty)
+                # ``f_variant_part`` slot.
+                inner_names: List[str] = []
+                if variant.f_components:
+                    try:
+                        inner_list = variant.f_components.f_components
+                        if inner_list:
+                            for c in inner_list:
+                                if c is None:
+                                    continue
+                                if c.is_a(lal.ComponentDecl):
+                                    # ``f_ids`` is a list of names
+                                    # for the component (``X`` /
+                                    # ``Y, Z``).
+                                    inner_names.append(
+                                        strip_ws(c.f_ids.text)
+                                    )
+                    except (lal.PropertyError, AttributeError):
+                        pass
+                if inner_names:
+                    self.add_lines([
+                        f":variant: when {choices_text} => "
+                        f"{', '.join(inner_names)}"
+                    ])
+                else:
+                    self.add_lines([
+                        f":variant: when {choices_text} => null"
+                    ])
+            self.add_lines(["end case"])
+
     def _emit_with_clause_directives(
         self, package_decl: lal.BasePackageDecl
     ) -> None:
@@ -2005,10 +2107,29 @@ class GenerateDoc(lal.App):
                     try:
                         for shape in decl.p_shapes():
                             for comp in shape.components:
-                                ctx = comp.parent.parent.parent
-                                s = comps.setdefault(comp, set())
-                                if not ctx.is_a(lal.Variant):
-                                    s.add(tuple(shape.discriminants_values))
+                                # Skip components inside
+                                # variants: they are documented
+                                # under their parent alternative
+                                # by ``_emit_variant_part_field``.
+                                # Previously this check only
+                                # filtered out the discriminant
+                                # values, but left the component
+                                # itself in ``comps``, which
+                                # caused variant components to be
+                                # double-emitted (once as a top
+                                # level ``:component:`` and once
+                                # inside ``:variant:``).
+                                if (
+                                    comp.parent
+                                    and comp.parent.parent
+                                    and comp.parent.parent.parent
+                                    and comp.parent.parent.parent
+                                    .is_a(lal.Variant)
+                                ):
+                                    continue
+                                comps.setdefault(
+                                    comp, set()
+                                ).add(tuple(shape.discriminants_values))  # type: ignore[arg-type]
                     except lal.PropertyError:
                         # TODO TA20-019: p_shapes will fail on some types that
                         # are considered records, so we should not crash on
@@ -2062,6 +2183,15 @@ class GenerateDoc(lal.App):
                         self.add_string(f":{comp_kind} {tn} {dn.text}:")
                         with self.indent():
                             self.add_lines(inner_doc)
+
+                # Emit any ``case ... is ... end case`` block
+                # as a ``:variant_part:`` body field with one
+                # ``:variant:`` sub-field per alternative. The
+                # component loop above explicitly skips
+                # components inside variants (their
+                # grand-parent is a ``Variant`` node); this is
+                # the only place variant components appear.
+                self._emit_variant_part_field(decl)
 
             # After the body-field emits close, drop back
             # to the parent indent and emit one

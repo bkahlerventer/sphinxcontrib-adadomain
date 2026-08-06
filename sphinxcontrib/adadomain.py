@@ -186,6 +186,18 @@ class AdaObject(ObjectDescription):
             names=("formal_kind",),
         ),
         Field(
+            "variant_part",
+            label=_("Variant part"),
+            has_arg=False,
+            names=("variant_part", "variantpart"),
+        ),
+        Field(
+            "variant",
+            label=_("Variant"),
+            has_arg=False,
+            names=("variant",),
+        ),
+        Field(
             "is_null",
             label=_("Null body"),
             has_arg=False,
