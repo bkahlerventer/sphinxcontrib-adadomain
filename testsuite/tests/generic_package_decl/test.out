@@ -1,5 +1,3 @@
-== pkg.rst ==
-
 
 Pkg
 ---
@@ -14,8 +12,12 @@ Pkg
     Element package documentation.
 
     :Formals:
+
+        :formal_kind: type
         .. ada:type:: type T
             :package: Pkg.Element
+
+            :spark_mode: ``Off``
 
 
             This type is private.
@@ -23,20 +25,28 @@ Pkg
     .. ada:procedure:: procedure Set (E : Pkg.Element.T)
         :package: Pkg.Element
 
+        :spark_mode: ``Off``
+
         A procedure that sets things.
 
     .. ada:procedure:: procedure Reset
         :package: Pkg.Element
+
+        :spark_mode: ``Off``
 
         This one resets things!
 
     .. ada:function:: function Get  return Pkg.Element.T
         :package: Pkg.Element
 
+        :spark_mode: ``Off``
+
         Oh! A getter, how nice it is!
 
     .. ada:function:: function Is_Valid  return Standard.Boolean
         :package: Pkg.Element
+
+        :spark_mode: ``Off``
 
         Return whether this is valid.
 

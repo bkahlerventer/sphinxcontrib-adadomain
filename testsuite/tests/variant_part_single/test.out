@@ -1,0 +1,19 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:type:: type Message_T
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    :discriminant Standard.Integer Kind:
+    :variant_part: case Kind is
+        :variant: when 0 => Length
+        :variant: when others => Raw
+        end case
+
+    Single-variant case: one when clause and one others.

@@ -1,0 +1,26 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+.. ada:generic_package:: Pkg
+
+
+:Formals:
+
+    :formal_kind: type
+    .. ada:type:: type F
+        :package: Pkg
+
+        :spark_mode: ``Off``
+
+
+
+
+    :formal_kind: subprogram
+    .. ada:function:: function Op (X : Pkg.F) return Standard.Integer
+        :package: Pkg
+
+        :spark_mode: ``Off``
+

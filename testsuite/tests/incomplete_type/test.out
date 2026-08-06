@@ -1,0 +1,26 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:incomplete_type:: Forward
+    :package: Pkg
+.. ada:type:: type Forward_Ptr
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+
+
+.. ada:type:: type Forward
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    :component Pkg.Forward_Ptr Next:
+
+    Incomplete type: ``type Forward;`` declares the forward
+    reference; the full definition appears later in the same
+    package.

@@ -1,0 +1,28 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:type:: type Counter
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    Public operations:
+        .. ada:function:: function Get  return Standard.Natural
+            :package: Pkg.Counter
+
+            :spark_mode: ``Off``
+
+
+        .. ada:entry:: entry Wait
+            :package: Pkg.Counter
+
+            :spark_mode: ``Off``
+
+
+
+    Private state:
+        :component: ``Natural := 0``  N

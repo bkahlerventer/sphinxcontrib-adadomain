@@ -1,0 +1,21 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:function:: function Classify (X : Standard.Integer) return Standard.Integer
+    :package: Pkg
+
+    **Contracts**
+       :contract_cases: ``(X > 0    => Classify'Result =  1,
+         X = 0    => Classify'Result =  0,
+         others   => Classify'Result = -1)``
+
+    :spark_mode: ``Off``
+.. ada:aspect:: Contract_Cases => X > 0 => Classify'Result = 1 on Pkg.Classify
+.. ada:aspect:: Contract_Cases => X = 0 => Classify'Result = 0 on Pkg.Classify
+.. ada:aspect:: Contract_Cases => others => Classify'Result = -1 on Pkg.Classify
+
+    Contract_Cases: whole aggregate AND per-case breakdown.

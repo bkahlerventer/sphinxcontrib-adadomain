@@ -1,0 +1,17 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:type:: type Flags
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    :representation: ``for Flags'Size use 16;``
+
+    :component Standard.Boolean A:
+    :component Standard.Boolean B:
+

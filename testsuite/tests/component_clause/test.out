@@ -1,0 +1,21 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:type:: type R
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    :representation: ``for R use record A at 0 range 0 .. 31; B at 4 range 0 .. 31; end record;``
+
+    :component_clause: ``A at 0 range 0 .. 31``
+    :component_clause: ``B at 4 range 0 .. 31``
+
+    :component Standard.Integer A:
+    :component Standard.Integer B:
+.. ada:rep_clause:: for R use record A at 0 range 0 .. 31; B at 4 range 0 .. 31; end record;
+

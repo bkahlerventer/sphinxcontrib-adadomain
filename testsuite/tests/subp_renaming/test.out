@@ -1,0 +1,29 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:function:: function Real (X : Standard.Integer) return Standard.Integer
+    :package: Pkg
+
+
+.. ada:subp_renaming:: function Aliased_Real renames Real
+    :package: Pkg
+
+:renames_target: ``Real``
+
+
+.. ada:procedure:: procedure Real_Proc (X : Standard.Integer)
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+
+.. ada:subp_renaming:: procedure Aliased_Real_Proc renames Real_Proc
+    :package: Pkg
+
+:renames_target: ``Real_Proc``
+
+    Two subprogram renamings: one function, one procedure.

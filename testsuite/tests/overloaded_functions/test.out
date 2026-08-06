@@ -1,0 +1,27 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:function:: function Foo (X : Standard.Integer) return Standard.Integer
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+
+.. ada:function:: function Foo (X : Standard.Integer; Y : Standard.Integer) return Standard.Integer
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+
+.. ada:function:: function Foo (S : Standard.String) return Standard.Integer
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    Three overloaded Foo functions with distinct parameter
+    profiles. Tier 3 collision-keying keeps all three
+    reachable via :ada:func:`Foo`.

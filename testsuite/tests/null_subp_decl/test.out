@@ -1,5 +1,3 @@
-== pkg.rst ==
-
 
 Pkg
 ---
@@ -7,7 +5,7 @@ Pkg
 .. ada:set_package:: Pkg
 
 
-.. ada:procedure:: procedure Test
+.. ada:null_subprogram:: procedure Test is null
     :package: Pkg
 
     This is a null procedure!

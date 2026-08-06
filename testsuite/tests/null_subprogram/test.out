@@ -1,0 +1,15 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:null_subprogram:: procedure Null_Proc is null
+    :package: Pkg
+
+
+.. ada:null_subprogram:: function Null_Func  return Standard.Boolean is null
+    :package: Pkg
+
+    Two null subprograms.

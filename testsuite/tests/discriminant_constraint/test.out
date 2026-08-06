@@ -1,0 +1,25 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:type:: type R
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+    :discriminant Standard.Integer D:
+    :component Standard.Integer A:
+
+
+.. ada:type:: type A
+    :package: Pkg
+
+    :spark_mode: ``Off``
+
+
+    :discriminant_constraint: ``(D => 0)``
+
+    Access type with a discriminant constraint.
