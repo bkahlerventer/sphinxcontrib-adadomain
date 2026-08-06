@@ -338,6 +338,16 @@ class GenerateDoc(lal.App):
                 # instantiation's source file are documented too.
                 inst = decl.cast(lal.GenericPackageInstantiation)
                 self.handle_instantiation(inst)
+            elif decl.is_a(lal.PackageBody):
+                # Package body (the ``.adb`` file). laldoc emits one
+                # RST page per source file; the ``.ads`` file is the
+                # canonical surface and the matching ``.adb`` is
+                # documented implicitly via the spec's directives.
+                # Any subprograms / entries defined in the body are
+                # surfaced by libadalang's cross-file resolver
+                # (``p_body_part``) when the spec walks them. We
+                # silently skip the body itself.
+                pass
             else:
                 package_decl = decl.cast(lal.BasePackageDecl)
                 self.handle_package(package_decl)
@@ -625,8 +635,10 @@ class GenerateDoc(lal.App):
                                  lal.GenericSubpInstantiation,
                                  lal.GenericPackageDecl,
                                  lal.PackageDecl,
+                                 lal.PackageBody,
                                  lal.NumberDecl,
-                                 lal.NullSubpDecl):
+                                 lal.NullSubpDecl,
+                                 lal.GenericSubpDecl):
                     self.warn('default entity handling for '
                               f'{P.relpath(decl.unit.filename)}:{decl}')
                 append_decl(decl)
@@ -2510,7 +2522,37 @@ class GenerateDoc(lal.App):
             self.handle_entity(inner)
             return
         else:
-            print(f"WARNING: Non handled entity: {decl}")
+            # Some decl kinds are intentionally not emitted as
+            # their own directive but are also not a warning-worthy
+            # surprise.
+            #
+            #   ``PackageBody`` is documented via its matching spec;
+            #   the spec's directive is the canonical surface.
+            #
+            #   ``GenericSubpDecl`` is a generic subprogram template
+            #   (``generic function Foo (...)``). The matching
+            #   instantiations are dispatched at Tier 4 as their own
+            #   ``.. ada:generic_subprogram_instantiation::``
+            #   directive; the template itself has no Sphinx analogue
+            #   yet and is left as a known gap.
+            #
+            #   ``GenericSubpInstantiation`` is dispatched at Tier 4
+            #   (``ada:generic-package-instantiation`` family); when
+            #    ``handle_entity``'s dispatch misses (e.g. a
+            #    declaration nested inside another package spec), it
+            #    falls through to here and would otherwise produce a
+            #    noise warning.
+            if not isinstance(
+                decl,
+                (
+                    lal.PackageBody,
+                    lal.GenericSubpDecl,
+                    lal.GenericSubpInstantiation,
+                ),
+            ):
+                print(
+                    f"WARNING: Non handled entity: {decl}"
+                )
 
         with self.indent():
             self.add_lines([''] + doc + [''])

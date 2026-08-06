@@ -1,0 +1,24 @@
+
+Pkg
+---
+
+.. ada:set_package:: Pkg
+
+
+.. ada:number:: Twelve : constant := 12;
+    :package: Pkg
+
+    :defval: ``12``
+
+
+.. ada:number:: Big : constant := 16#FFFF#;
+    :package: Pkg
+
+    :defval: ``16#FFFF#``
+
+
+.. ada:number:: Pi : constant := 3.14159;
+    :package: Pkg
+
+    :defval: ``3.14159``
+

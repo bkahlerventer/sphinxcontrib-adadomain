@@ -74,7 +74,26 @@ logger = logging.getLogger(__name__)
 ada_type_sig_re = re.compile(r"^type\s+(\w+)", re.VERBOSE)
 ada_object_sig_re = re.compile(r"^(\w+)\s+(:\s+.+)", re.VERBOSE)
 ada_number_sig_re = re.compile(
-    r"^(\w+)\s+:\s+constant\s+(\S+)", re.VERBOSE
+    # Shape A: ``Name : constant TypeExpr [:= Expr]``
+    # Shape B: ``Name : constant := Expr`` (no explicit type; the
+    # type is inferred from the expression's nominal subtype).
+    # The first branch's leading negative lookahead ``(?!\s*:=)``
+    # sits BEFORE the first char of the type capture is consumed,
+    # so it correctly rejects Shape B (which begins with ``:=``).
+    # The second branch carries the expression capture for Shape
+    # B. ``;?`` at the end tolerates an optional trailing
+    # semicolon that laldoc may carry.
+    r"""
+        ^(?P<name>\w+)\s*:\s*constant
+        (?:
+            \s+(?!\s*:=)(?P<type>\S.*?)
+            (?:\s*:=\s*(?P<expr_a>.+?))?
+          |
+            \s*:=\s*(?P<expr_b>.+?)
+        )
+        \s*;?\s*$
+    """,
+    re.VERBOSE,
 )
 ada_entry_sig_re = re.compile(
     r"^entry\s+(\w+)\s*(\(.*\))?\s*$", re.VERBOSE | re.DOTALL
@@ -678,15 +697,39 @@ class AdaObject(ObjectDescription):
         name: Union[str, None] = None
         descr: Union[str, None] = None
 
-        # libadalang-first: wrap in a package spec and parse
-        # with package_decl_rule. Walk into the public part and
-        # pick the first ObjectDecl whose ``f_is_constant`` is
-        # True. ``f_default_expr`` may be present (constants
-        # usually have one) but is not required.
+        # libadalang-first: wrap the sig in a package spec and
+        # parse with package_decl_rule. The wrap is needed
+        # because the package_decl_rule parses a single library
+        # item; a bare number declaration is not a complete
+        # library item on its own.
+        #
+        # libadalang distinguishes two number-decl shapes at the
+        # AST level:
+        #
+        #   * Shape A (typed):
+        #         ``Name : constant Type [:= Expr];``
+        #     parses as ``lal.ObjectDecl`` with
+        #     ``f_is_constant = True`` and ``f_type_expr`` set.
+        #
+        #   * Shape B (type inferred from expression):
+        #         ``Name : constant := Expr;``
+        #     parses as ``lal.NumberDecl`` (Ada 2022 grammar
+        #     disambiguation). The number decl carries no
+        #     ``f_type_expr`` because the type comes from the
+        #     expression's nominal subtype.
+        #
+        # We accept both shapes here. The libadalang version on
+        # this host (26.0.0) parses both cleanly.
         if USE_LAL:
             try:
-                tail = " := 0" if ":=" not in sig else ""
-                wrapped = f"package Wrap is {sig}{tail}; end Wrap;"
+                # laldoc may pass the sig with or without a
+                # trailing ``;``. Strip ours if present, then
+                # add exactly one ``;`` so the parser doesn't
+                # choke on ``;;``.
+                stripped = sig.rstrip().rstrip(";").rstrip()
+                wrapped = (
+                    f"package Wrap is {stripped}; end Wrap;"
+                )
                 unit = lal_context.get_from_buffer(
                     f"<ada_num_{id(self)}>",
                     wrapped,
@@ -700,7 +743,11 @@ class AdaObject(ObjectDescription):
                     and pkg.f_public_part.f_decls
                 ):
                     decl = pkg.f_public_part.f_decls[0]
-                    if isinstance(decl, lal.ObjectDecl) and decl.f_ids:
+                    # Shape A: typed constant as ObjectDecl.
+                    if (
+                        isinstance(decl, lal.ObjectDecl)
+                        and decl.f_ids
+                    ):
                         name = decl.f_ids[0].text
                         if decl.f_type_expr is not None:
                             type_text = decl.f_type_expr.text
@@ -711,6 +758,17 @@ class AdaObject(ObjectDescription):
                                 )
                             else:
                                 descr = f" : constant {type_text}"
+                    # Shape B: type-inferred number decl.
+                    elif isinstance(decl, lal.NumberDecl):
+                        # NumberDecl has no defining-name list;
+                        # the identifier lives on ``f_ids``.
+                        if decl.f_ids:
+                            name = decl.f_ids[0].text
+                        expr_text = (
+                            decl.f_expr.text
+                            if decl.f_expr is not None else ""
+                        )
+                        descr = f" : constant := {expr_text}"
             except Exception:
                 name = None
                 descr = None
@@ -721,7 +779,14 @@ class AdaObject(ObjectDescription):
             if m is None:
                 raise Exception(f"could not parse number sig {sig!r}")
             name = m.group(1)
+            # The regex captures optional type (group 2) and
+            # optional ``:= expr`` (group 3). Reconstruct the
+            # descr from the original sig so we keep the
+            # canonical source shape (`` : constant ...``).
             descr = sig[len(name):]
+            # Drop trailing ``;`` if laldoc left one; the
+            # directive body does not carry a ``;``.
+            descr = descr.rstrip(";").rstrip()
 
         assert descr is not None
         if not descr.startswith(" "):
