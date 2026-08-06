@@ -242,6 +242,14 @@ class GenerateDoc(lal.App):
 
         os.makedirs(self.args.output_dir, exist_ok=True)
 
+        # Tier 3b: load gnatprove summary output once before
+        # processing units. ``project_root`` is the cwd of
+        # the laldoc invocation, which is the directory that
+        # contains the ``.gpr`` file (and therefore ``obj/``).
+        self._gnatprove_results = self._parse_gnatprove_output(
+            os.getcwd()
+        )
+
         # Sort unit by filename to have a deterministic processing order
         for _, unit in sorted(self.units.items()):
             self.process_unit(unit)
@@ -1599,6 +1607,116 @@ class GenerateDoc(lal.App):
 
         walk(unit.root)
 
+    def _parse_gnatprove_output(
+        self, project_root: str
+    ) -> Dict[str, Tuple[str, int]]:
+        """
+        Parse the per-package gnatprove summary output and
+        return a map of ``entity_fqn -> (status, check_count)``.
+
+        Tier 3b: gnatprove is invoked outside laldoc (typically
+        by the project's Makefile). Its per-package summary
+        file ``obj/<project>/gnatprove/gnatprove.out`` contains
+        per-entity lines of the form::
+
+            Spark_Demo.Double at spark_demo.ads:5 flow
+              analyzed (0 errors, 0 checks, 0 warnings and 0
+              pragma Assume statements) and proved (3 checks)
+
+        We extract the entity name (everything before the
+        `` at <file>:<line>``), the status word (``proved``
+        / ``unproved`` / ``not analyzed``), and the check
+        count (the integer in parentheses on the same line).
+
+        Silently returns an empty dict if the output file is
+        not present (gnatprove was not run, or the project has
+        no SPARK code).
+        """
+        candidates = [
+            'gnatprove.out',
+            'gnatprove/gnatprove.out',
+        ]
+        # Walk obj/* for the gnatprove output file.
+        obj_dir = os.path.join(project_root, 'obj')
+        out_path = None
+        if os.path.isdir(obj_dir):
+            for root, _dirs, files in os.walk(obj_dir):
+                for f in files:
+                    if f == 'gnatprove.out':
+                        out_path = os.path.join(root, f)
+                        break
+                if out_path is not None:
+                    break
+        if out_path is None:
+            return {}
+        results: Dict[str, Tuple[str, int]] = {}
+        try:
+            with open(out_path, 'r', encoding='utf-8') as fp:
+                content = fp.read()
+        except OSError:
+            return {}
+        # The summary section header is "Detailed analysis
+        # report". Walk every line after it.
+        in_detail = False
+        for line in content.splitlines():
+            if 'Detailed analysis report' in line:
+                in_detail = True
+                continue
+            if not in_detail:
+                continue
+            # Strip leading whitespace (gnatprove indents the
+            # entity lines by 2 spaces).
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # Match patterns like:
+            #   ``Pkg.Subprog at file.ads:5 ... proved (N checks)``
+            #   ``Pkg.Subprog at file.ads:5 ... unproved (N checks)``
+            m = re.match(
+                r'^(\S+)\s+at\s+\S+:\d+\s+.*?\b'
+                r'(proved|unproved|not analyzed|not checked)\b'
+                r'(?:\s*\((\d+)\s+checks?\))?',
+                stripped,
+            )
+            if m is None:
+                continue
+            entity_fqn = m.group(1)
+            status = m.group(2)
+            check_count = int(m.group(3)) if m.group(3) else 0
+            # Replace the last ``.`` with ``.`` (no-op) so
+            # ``Pkg.Subprog`` matches the libadalang FQN.
+            results[entity_fqn] = (status, check_count)
+        return results
+
+    def _emit_proof_status_field(
+        self, decl: lal.BasicDecl, status: str, check_count: int
+    ) -> None:
+        """
+        Emit a ``:proof_status:`` body field on ``decl`` if it
+        has a proof status from gnatprove. Tier 3b surfaces
+        the SPARK proof status alongside the existing
+        ``:spark_mode:`` field so readers see whether the
+        subprogram's contracts are machine-checked.
+
+        Status values:
+          - ``proved``: all checks pass.
+          - ``unproved``: some checks did not pass.
+          - ``not analyzed``: gnatprove was run but did not
+            inspect this entity (e.g. SPARK_Mode => Off).
+          - ``not checked``: gnatprove was not run on this
+            entity at all.
+        """
+        if not isinstance(decl, lal.BasicSubpDecl):
+            return
+        if not decl.p_defining_name:
+            return
+        # Render as ``:proof_status: <status> (<N> checks)``
+        # so the field is both human-readable and grep-able.
+        self.add_lines([''])
+        self.add_lines(
+            [f":proof_status: ``{status} ({check_count} checks)``"]
+        )
+
     def handle_entity(self, decl: lal.BasicDecl):
 
         def make_profile(s: lal.BaseSubpSpec) -> str:
@@ -1776,6 +1894,14 @@ class GenerateDoc(lal.App):
             with self.indent():
                 self._emit_aspects_body_field(decl)
                 self._emit_spark_mode_field(decl)
+                # Tier 3b: if gnatprove ran on this project,
+                # emit a ``:proof_status:`` field with the
+                # per-entity proof result.
+                fqn = decl.p_fully_qualified_name
+                results = getattr(self, '_gnatprove_results', None)
+                if results and fqn in results:
+                    status, count = results[fqn]
+                    self._emit_proof_status_field(decl, status, count)
 
             # Drop back to parent indent and emit one
             # ``.. ada:aspect::`` per aspect and one

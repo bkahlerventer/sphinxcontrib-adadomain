@@ -253,6 +253,12 @@ class AdaObject(ObjectDescription):
             has_arg=False,
             names=("body",),
         ),
+        Field(
+            "proof_status",
+            label=_("Proof status"),
+            has_arg=False,
+            names=("proof_status",),
+        ),
         TypedField(
             "aspect",
             label=_("Aspect"),
@@ -1145,11 +1151,15 @@ class AdaDomain(Domain):
     name = "ada"
     label = "Ada"
 
-    # Bump when ``initial_data`` schema changes. The schema gains the
-    # ``packages`` key in 1.0.fork1 because ``AdaPackageIndex`` is now
-    # actively used (it was defined before but never populated by any
-    # consumer on the upstream master branch).
-    data_version = 2
+    # bumped to 2 in 1.0.fork1 because ``AdaPackageIndex`` is
+    # now actively used (it was defined before but never
+    # populated by any consumer on the upstream master branch).
+    # Bumped to 3 in 0.7 because ``self.objects`` changed
+    # shape: fullname -> list[ObjectEntry] (one per overload)
+    # instead of fullname -> ObjectEntry. Pre-0.7 pickled envs
+    # are discarded on first build with this fork; the new
+    # env is rebuilt from source.
+    data_version = 3
 
     object_types = {
         "function": ObjType(_("function"), "func"),
@@ -1213,8 +1223,22 @@ class AdaDomain(Domain):
     }
 
     # TODO: Is this useful?
+    # Type annotation on ``objects`` widens to ``Union[list,
+    # ObjectEntry]`` so the defensive ``isinstance(entries,
+    # list)`` checks in ``note_object`` / ``clear_doc`` type-
+    # narrow correctly under Pyright. Sphinx's pickle machinery
+    # only round-trips the runtime value, not the type
+    # annotation, so the runtime type is always ``list`` for
+    # envs built with this fork.
     initial_data: dict = {
-        "objects": {},  # fullname -> docname, objtype
+        # Tier 3a: ``objects`` is now fullname -> list of
+        # ObjectEntry (one per overload) instead of fullname ->
+        # ObjectEntry. Old pickled envs from sphinxcontrib-
+        # adadomain 0.5 with the singleton shape are picked up
+        # by ``note_object`` defensively and migrated in place.
+        # The pickled-env data_version bump below is the
+        # authoritative signal to discard pre-Tier-3a envs.
+        "objects": {},  # fullname -> list[ObjectEntry]
         "functions": {},  # fullname -> arity -> (targetname, docname)
         "procedures": {},  # fullname -> arity -> (targetname, docname)
         "packages": {},
@@ -1226,34 +1250,84 @@ class AdaDomain(Domain):
     ]
 
     def clear_doc(self, docname: str) -> None:
-        for fullname, obj in list(self.objects.items()):
-            if obj.docname == docname:
+        # Tier 3a: ``self.objects[name]`` is now a list of
+        # ObjectEntry. We filter out entries belonging to
+        # ``docname`` and rebuild the (possibly shorter) list.
+        for fullname, entries in list(self.objects.items()):
+            if not isinstance(entries, list):
+                entries = [entries]
+            keep = [e for e in entries if e.docname != docname]
+            if not keep:
                 del self.objects[fullname]
+            elif len(keep) < len(entries):
+                self.objects[fullname] = keep
 
     def _find_obj(
         self, env: BuildEnvironment, modname: str, name: str, objtype: str
     ) -> Tuple[str, str]:
         """
-        Find a Ada object for "name", perhaps using the given module and/or
-        classname.
+        Find a Ada object for ``name``, perhaps using the given
+        module and/or classname.
 
-        TODO: Handling references to overloaded functions.
+        Tier 3a: a single name may now resolve to multiple
+        ObjectEntry records (overloaded functions). This method
+        returns the first overload it finds and its docname.
+        Use ``_find_overloads`` to get the full list when
+        disambiguation matters (e.g. an overload summary
+        directive).
         """
-        # First try: try to find an object by that name (this is assuming that
-        # the user used a fully qualified name)
-        obj = self.objects.get(name, None)
+        # First try: try to find an object by that name (this is
+        # assuming that the user used a fully qualified name).
+        # ``self.objects[name]`` is now a list of ObjectEntry.
+        entries = self.objects.get(name)
 
-        # Second try: try prefixing the object with the module name.
-        if obj is None:
+        # Second try: try prefixing the object with the module
+        # name.
+        if entries is None:
             fqn = f"{modname}.{name}"
-            obj = self.objects.get(fqn)
-            if obj is not None:
+            entries = self.objects.get(fqn)
+            if entries is not None:
                 name = fqn
 
-        if obj:
-            return name, obj.docname
+        if entries:
+            # Take the first overload. ``resolve_xref`` does
+            # not know which overload the caller wants without
+            # additional context (arity, types); picking the
+            # first preserves the existing behaviour for the
+            # common single-overload case.
+            entry = entries[0] if isinstance(entries, list) else entries
+            return name, entry.docname
 
         return ("", "")
+
+    def _find_overloads(
+        self, env: BuildEnvironment, modname: str, name: str
+    ) -> List[Tuple[str, str, str]]:
+        """
+        Return all overloads matching ``name`` (or
+        ``modname.name`` as fallback).
+
+        Each result is ``(fullname, docname, objtype)``.
+        Returns an empty list when nothing matches.
+
+        Tier 3a: this is the disambiguation entry point for
+        the overload-aware cross-reference resolver. The
+        overload summary directive uses it to render a
+        ``:ada:func:`Foo`` page that lists every overload and
+        links to it.
+        """
+        results: List[Tuple[str, str, str]] = []
+        for fqn in (name, f"{modname}.{name}"):
+            entries = self.objects.get(fqn)
+            if entries is None:
+                continue
+            # Accept both list (current) and single ObjectEntry
+            # (legacy pickled env).
+            if not isinstance(entries, list):
+                entries = [entries]
+            for entry in entries:
+                results.append((fqn, entry.docname, entry.objtype))
+        return results
 
     def resolve_xref(
         self, env: BuildEnvironment, fromdocname: str,
@@ -1346,30 +1420,85 @@ class AdaDomain(Domain):
         return results
 
     def get_objects(self) -> Iterator[Tuple[str, str, str, str, str, int]]:
-        for refname, obj in self.objects.items():
-            yield refname, refname, obj.objtype, obj.docname, obj.node_id, 1
+        # Tier 3a: ``self.objects[name]`` is now a list of
+        # ObjectEntry. We yield one inventory entry per
+        # overload so all overloads are reachable from
+        # intersphinx consumers. The ``refname`` is qualified
+        # with the node_id when there are multiple overloads
+        # so inventory consumers can disambiguate. Without the
+        # suffix, two overloads of ``Foo`` would collide in
+        # the inventory.
+        for refname, entries in self.objects.items():
+            if not isinstance(entries, list):
+                entries = [entries]
+            for idx, obj in enumerate(entries):
+                if len(entries) > 1:
+                    qualified = f"{refname}#{obj.node_id}"
+                else:
+                    qualified = refname
+                yield (
+                    qualified,
+                    refname,
+                    obj.objtype,
+                    obj.docname,
+                    obj.node_id,
+                    1,
+                )
 
     @property
-    def objects(self) -> Dict[str, ObjectEntry]:
-        return self.data.setdefault("objects", {})  # fullname -> ObjectEntry
+    def objects(self) -> Dict[str, Union[List[ObjectEntry], ObjectEntry]]:
+        # The dict maps ``fullname`` to either a list of
+        # ObjectEntry (one per overload, current shape) or a
+        # single ObjectEntry (legacy pickled env from
+        # sphinxcontrib-adadomain < 0.7). ``note_object`` /
+        # ``clear_doc`` migrate single-ObjectEntry values to
+        # lists on first access. ``get_objects`` accepts both
+        # shapes.
+        return self.data.setdefault(
+            "objects", {}
+        )  # fullname -> list[ObjectEntry] | ObjectEntry
 
     def note_object(
         self, name: str, objtype: str, node_id: str, location: Any = None
     ) -> None:
         """
         Note an ada object for cross references.
+
+        Tier 3a: when a name is overloaded (e.g. two
+        ``Foo`` functions with different parameter lists), the
+        upstream implementation warns and overwrites; the
+        second overload becomes unreachable via
+        ``:ada:func:`Foo```. We instead keep a list of all
+        overloads under the same name. ``_find_obj`` returns
+        the first overload; ``_find_overloads`` returns the
+        full list for callers that need to disambiguate.
+
+        ``self.objects`` now maps fullname -> list of
+        ObjectEntry. Older callers that indexed
+        ``self.objects[name]`` expecting an ObjectEntry
+        directly have been updated to take ``[0]`` of the
+        list.
         """
-        if name in self.objects:
-            other = self.objects[name]
+        new_entry = ObjectEntry(self.env.docname, node_id, objtype)
+        existing = self.objects.get(name)
+        if existing is None:
+            self.objects[name] = [new_entry]
+            return
+        # Defensive: accept either a list (current) or a
+        # single ObjectEntry (legacy pickled env from before
+        # Tier 3a).
+        if isinstance(existing, list):
+            existing.append(new_entry)
+        else:
             logger.warning(
                 __(
                     "duplicate object description of %s, "
                     "other instance in %s, use :noindex: for one of them"
                 ),
                 name,
-                other.docname,
+                existing.docname,
             )
-        self.objects[name] = ObjectEntry(self.env.docname, node_id, objtype)
+            self.objects[name] = [existing, new_entry]
 
     @staticmethod
     def add_missing_reference(
