@@ -79,6 +79,10 @@ ada_number_sig_re = re.compile(
 ada_entry_sig_re = re.compile(
     r"^entry\s+(\w+)\s*(\(.*\))?\s*$", re.VERBOSE | re.DOTALL
 )
+ada_null_subp_sig_re = re.compile(
+    r"^(?:procedure|function)\s+(\w+|\".*?\")\s*(.*?)\s+is\s+null$",
+    re.VERBOSE | re.DOTALL
+)
 ada_aspect_sig_re = re.compile(
     r"^(\w+)(?:\s*=>\s*(.+?))?\s+on\s+(.+)$", re.VERBOSE | re.DOTALL
 )
@@ -90,6 +94,19 @@ ada_rep_clause_sig_re = re.compile(
 )
 ada_with_clause_sig_re = re.compile(
     r"^with\s+(.+?)\s+on\s+(.+)$", re.VERBOSE | re.DOTALL
+)
+ada_subp_renaming_sig_re = re.compile(
+    r"^(?:procedure|function)\s+(\w+|\".*?\")\s+renames\s+(.+)$",
+    re.VERBOSE | re.DOTALL
+)
+ada_package_renaming_sig_re = re.compile(
+    r"^(\w+)\s+renames\s+(.+)$", re.VERBOSE | re.DOTALL
+)
+ada_incomplete_type_sig_re = re.compile(
+    r"^(\w+)$", re.VERBOSE
+)
+ada_generic_formal_sig_re = re.compile(
+    r"^(type|package|procedure|function)\s+(.+)$", re.VERBOSE | re.DOTALL
 )
 ada_package_inst_sig_re = re.compile(
     r"^package\s+(\w+)\s+is\s+new\s+([\w\.]+)\s*", re.VERBOSE
@@ -711,6 +728,36 @@ class AdaObject(ObjectDescription):
             signode += addnodes.desc_annotation(text=params)
         return name
 
+    def handle_null_subp_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a null subprogram declaration.
+
+        Signature shape: ``procedure Foo`` or
+        ``function Foo return T`` followed by `` is null``.
+        The keyword ``null`` is what makes this directive
+        different from ``ada:function`` / ``ada:procedure``;
+        it signals that the subprogram has an empty body.
+
+        The signature parser peels off the ``procedure`` /
+        ``function`` keyword, the name, and any return-type /
+        parameter tail, then renders the declaration as the
+        directive's signature. The ``is null`` trailer is
+        implied by the directive's objtype so we do not
+        re-emit it.
+        """
+        m = ada_null_subp_sig_re.match(sig)
+        if m is None:
+            raise Exception(f"could not parse null subp sig {sig!r}")
+        name, tail = m.groups()
+        tail = tail.strip()
+        is_func = bool(tail)
+        kind = "function " if is_func else "procedure "
+        signode += addnodes.desc_annotation(text=kind)
+        signode += addnodes.desc_name(text=name)
+        if tail:
+            signode += addnodes.desc_annotation(text=f" {tail}")
+        return name
+
     def handle_aspect_sig(self, sig: str, signode: desc_signature) -> str:
         """
         Parse an aspect declaration.
@@ -802,6 +849,115 @@ class AdaObject(ObjectDescription):
         signode += addnodes.desc_annotation(text=f" on {owner}")
         return imports
 
+    def handle_subp_renaming_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a subprogram renaming declaration.
+
+        Signature shape: ``procedure Foo renames Real_Impl``
+        or ``function Foo return T renames Real_Impl``. The
+        new name is the desc_name; the renamed target is a
+        pending xref so readers can click through to the
+        actual entity.
+        """
+        m = ada_subp_renaming_sig_re.match(sig)
+        if m is None:
+            raise Exception(
+                f"could not parse subp-renaming sig {sig!r}"
+            )
+        name, target = m.groups()
+        # Detect ``procedure`` vs ``function`` from the sig
+        # prefix; ``renames`` makes the spec opaque so we
+        # cannot rely on libadalang's ``p_returns``.
+        if sig.lstrip().startswith("procedure"):
+            kind_kw = "procedure "
+        else:
+            kind_kw = "function "
+        signode += addnodes.desc_annotation(text=kind_kw)
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_annotation(text=" renames ")
+        # Render the renamed target as a pending xref so it
+        # links to the original entity.
+        refnode = addnodes.pending_xref(
+            "",
+            refdomain="ada",
+            refexplicit=False,
+            reftype="ref",
+            reftarget=target.strip(),
+        )
+        refnode += addnodes.desc_name(text=target.strip())
+        signode += refnode
+        return name
+
+    def handle_package_renaming_sig(
+        self, sig: str, signode: desc_signature
+    ) -> str:
+        """
+        Parse a package renaming declaration.
+
+        Signature shape: ``Foo renames Bar.Baz``. ``Foo`` is
+        the desc_name; ``Bar.Baz`` is a pending xref.
+        """
+        m = ada_package_renaming_sig_re.match(sig)
+        if m is None:
+            raise Exception(
+                f"could not parse package-renaming sig {sig!r}"
+            )
+        name, target = m.groups()
+        signode += addnodes.desc_name(text=name)
+        signode += addnodes.desc_annotation(text=" renames ")
+        refnode = addnodes.pending_xref(
+            "",
+            refdomain="ada",
+            refexplicit=False,
+            reftype="mod",
+            reftarget=target.strip(),
+        )
+        refnode += addnodes.desc_name(text=target.strip())
+        signode += refnode
+        return name
+
+    def handle_incomplete_type_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse an incomplete type declaration.
+
+        Signature shape: ``Foo`` (bare name). The ``type``
+        keyword is implied by the objtype. Incomplete types
+        are forward declarations (``type Foo;``) whose full
+        declaration appears later in the same package; they
+        have no body to render.
+        """
+        m = ada_incomplete_type_sig_re.match(sig)
+        if m is None:
+            raise Exception(
+                f"could not parse incomplete-type sig {sig!r}"
+            )
+        name = m.group(1)
+        signode += addnodes.desc_annotation(text="type ")
+        signode += addnodes.desc_name(text=name)
+        return name
+
+    def handle_generic_formal_sig(self, sig: str, signode: desc_signature) -> str:
+        """
+        Parse a generic formal parameter declaration.
+
+        Signature shape: ``type Foo`` (formal type),
+        ``package Foo is new Bar`` (formal package),
+        ``procedure Foo`` (formal procedure),
+        ``function Foo return T`` (formal function). The
+        kind keyword is the desc_annotation; the rest of
+        the sig is the desc_name (rendered verbatim since
+        formal kinds vary widely).
+        """
+        m = ada_generic_formal_sig_re.match(sig)
+        if m is None:
+            raise Exception(
+                f"could not parse generic-formal sig {sig!r}"
+            )
+        kind, rest = m.groups()
+        signode += addnodes.desc_annotation(text=f"{kind} ")
+        signode += addnodes.desc_name(text=rest.strip())
+        return rest.strip().split()[0] if rest.strip() else ""
+
     def handle_package_inst(self, sig: str, signode: desc_signature) -> str:
         """
         Parse a generic package instantiation.
@@ -868,6 +1024,8 @@ class AdaObject(ObjectDescription):
             ret = self.handle_number_sig(sig, signode)
         elif self.objtype == "entry":
             ret = self.handle_entry_sig(sig, signode)
+        elif self.objtype == "null_subprogram":
+            ret = self.handle_null_subp_sig(sig, signode)
         elif self.objtype == "aspect":
             ret = self.handle_aspect_sig(sig, signode)
         elif self.objtype == "pragma":
@@ -876,6 +1034,14 @@ class AdaObject(ObjectDescription):
             ret = self.handle_rep_clause_sig(sig, signode)
         elif self.objtype == "with_clause":
             ret = self.handle_with_clause_sig(sig, signode)
+        elif self.objtype == "subp_renaming":
+            ret = self.handle_subp_renaming_sig(sig, signode)
+        elif self.objtype == "package_renaming":
+            ret = self.handle_package_renaming_sig(sig, signode)
+        elif self.objtype == "incomplete_type":
+            ret = self.handle_incomplete_type_sig(sig, signode)
+        elif self.objtype == "generic_formal":
+            ret = self.handle_generic_formal_sig(sig, signode)
         elif self.objtype == "exception":
             ret = self.handle_exception_sig(sig, signode)
         elif self.objtype == "generic-package-instantiation":
@@ -900,6 +1066,8 @@ class AdaObject(ObjectDescription):
             return f"{name} (Ada constant)"
         elif self.objtype == "entry":
             return f"{name} (Ada entry)"
+        elif self.objtype == "null_subprogram":
+            return f"{name} (Ada null subprogram)"
         elif self.objtype == "aspect":
             return f"{name} (Ada aspect)"
         elif self.objtype == "pragma":
@@ -908,8 +1076,16 @@ class AdaObject(ObjectDescription):
             return f"{name} (Ada representation clause)"
         elif self.objtype == "with_clause":
             return f"{name} (Ada with clause)"
+        elif self.objtype == "subp_renaming":
+            return f"{name} (Ada renaming)"
+        elif self.objtype == "package_renaming":
+            return f"{name} (Ada package renaming)"
+        elif self.objtype == "incomplete_type":
+            return f"{name} (Ada incomplete type)"
+        elif self.objtype == "generic_formal":
+            return f"{name} (Ada generic formal)"
         else:
-            return ""
+            return f"{name} (Ada {self.objtype})"
 
     def _object_hierarchy_parts(
         self, sig_node: desc_signature
@@ -948,12 +1124,29 @@ class AdaObject(ObjectDescription):
 
         full_name = self.get_full_name(signode, name)
 
-        node_id = make_id(self.env, self.state.document, "", full_name)
+        # Tier 4 collision fix: ``node_id`` is derived from
+        # ``full_name + objtype`` (not just ``full_name``)
+        # so that a ``function Foo`` and a ``procedure Foo``
+        # in the same package get distinct DOM ids. Without
+        # this, Sphinx's ``make_id`` would assign the same
+        # ``id`` to both, and the second directive's id would
+        # be auto-suffixed (``id0``, ``id1`` ...) which makes
+        # cross-references from external docs ambiguous.
+        id_key = f"{full_name}@{self.objtype}"
+        node_id = make_id(self.env, self.state.document, "", id_key)
         signode["ids"].append(node_id)
 
         # Assign old styled node_id(full_name) not to break old hyperlinks (if
-        # possible) Note: Will removed in Sphinx-5.0 (RemovedInSphinx50Warning)
-        if node_id != full_name and full_name not in self.state.document.ids:
+        # possible) Note: Will removed in Sphinx-5.0 (RemovedInSphinx50Warning).
+        # Tier 4: only assign the bare full_name alias when no
+        # same-typed sibling has already claimed it (i.e. for
+        # the first function Foo OR the first procedure Foo,
+        # not both). We check ``self.state.document.ids`` to
+        # avoid duplicate-id warnings.
+        if (
+            node_id != full_name
+            and full_name not in self.state.document.ids
+        ):
             signode["ids"].append(full_name)
 
         self.state.document.note_explicit_target(signode)
@@ -1156,10 +1349,13 @@ class AdaDomain(Domain):
     # populated by any consumer on the upstream master branch).
     # Bumped to 3 in 0.7 because ``self.objects`` changed
     # shape: fullname -> list[ObjectEntry] (one per overload)
-    # instead of fullname -> ObjectEntry. Pre-0.7 pickled envs
-    # are discarded on first build with this fork; the new
-    # env is rebuilt from source.
-    data_version = 3
+    # instead of fullname -> ObjectEntry. Bumped to 4 in 0.8
+    # because storage keys changed again: the key is now
+    # ``name@objtype`` (a join with the objtype) so that
+    # ``function Foo`` and ``procedure Foo`` in the same
+    # package no longer collide. Pre-0.8 pickled envs are
+    # discarded on first build with this fork.
+    data_version = 4
 
     object_types = {
         "function": ObjType(_("function"), "func"),
@@ -1169,6 +1365,7 @@ class AdaDomain(Domain):
         "object": ObjType(_("object"), "obj"),
         "number": ObjType(_("number"), "num"),
         "entry": ObjType(_("entry"), "entry"),
+        "null_subprogram": ObjType(_("null subprogram"), "nullsubp"),
         "exception": ObjType(_("exception"), "exc"),
         "generic_package": ObjType(_("generic package"), "genpkg"),
         "generic-package-instantiation": ObjType(
@@ -1178,6 +1375,16 @@ class AdaDomain(Domain):
         "pragma": ObjType(_("pragma"), "pragma"),
         "rep_clause": ObjType(_("representation clause"), "repclause"),
         "with_clause": ObjType(_("with clause"), "withclause"),
+        "subp_renaming": ObjType(
+            _("subprogram renaming"), "subpren"
+        ),
+        "package_renaming": ObjType(
+            _("package renaming"), "pkgren"
+        ),
+        "incomplete_type": ObjType(
+            _("incomplete type"), "inctype"
+        ),
+        "generic_formal": ObjType(_("generic formal"), "genformal"),
     }
 
     directives = {
@@ -1190,12 +1397,17 @@ class AdaDomain(Domain):
         "object": AdaObject,
         "number": AdaObject,
         "entry": AdaObject,
+        "null_subprogram": AdaObject,
         "exception": AdaObject,
         "generic-package-instantiation": AdaObject,
         "aspect": AdaObject,
         "pragma": AdaObject,
         "rep_clause": AdaObject,
         "with_clause": AdaObject,
+        "subp_renaming": AdaObject,
+        "package_renaming": AdaObject,
+        "incomplete_type": AdaObject,
+        "generic_formal": AdaObject,
     }
     roles = {
         "func": AdaXRefRole(),
@@ -1216,10 +1428,15 @@ class AdaDomain(Domain):
         # to the right lookup.
         "num": AdaXRefRole(),
         "entry": AdaXRefRole(),
+        "nullsubp": AdaXRefRole(),
         "aspect": AdaXRefRole(),
         "pragma": AdaXRefRole(),
         "repclause": AdaXRefRole(),
         "withclause": AdaXRefRole(),
+        "subpren": AdaXRefRole(),
+        "pkgren": AdaXRefRole(),
+        "inctype": AdaXRefRole(),
+        "genformal": AdaXRefRole(),
     }
 
     # TODO: Is this useful?
@@ -1250,17 +1467,19 @@ class AdaDomain(Domain):
     ]
 
     def clear_doc(self, docname: str) -> None:
-        # Tier 3a: ``self.objects[name]`` is now a list of
-        # ObjectEntry. We filter out entries belonging to
-        # ``docname`` and rebuild the (possibly shorter) list.
-        for fullname, entries in list(self.objects.items()):
+        # Tier 3a: ``self.objects[key]`` is now a list of
+        # ObjectEntry (where ``key`` is ``name@objtype`` for
+        # Tier 4 envs, bare ``name`` for legacy envs).
+        # Filter out entries belonging to ``docname`` and
+        # rebuild the (possibly shorter) list.
+        for key, entries in list(self.objects.items()):
             if not isinstance(entries, list):
                 entries = [entries]
             keep = [e for e in entries if e.docname != docname]
             if not keep:
-                del self.objects[fullname]
+                del self.objects[key]
             elif len(keep) < len(entries):
-                self.objects[fullname] = keep
+                self.objects[key] = keep
 
     def _find_obj(
         self, env: BuildEnvironment, modname: str, name: str, objtype: str
@@ -1269,21 +1488,36 @@ class AdaDomain(Domain):
         Find a Ada object for ``name``, perhaps using the given
         module and/or classname.
 
-        Tier 3a: a single name may now resolve to multiple
-        ObjectEntry records (overloaded functions). This method
-        returns the first overload it finds and its docname.
-        Use ``_find_overloads`` to get the full list when
-        disambiguation matters (e.g. an overload summary
-        directive).
-        """
-        # First try: try to find an object by that name (this is
-        # assuming that the user used a fully qualified name).
-        # ``self.objects[name]`` is now a list of ObjectEntry.
-        entries = self.objects.get(name)
+        Tier 3a: a single (name, objtype) pair may now resolve
+        to multiple ObjectEntry records (overloaded functions).
+        This method returns the first overload it finds and
+        its docname. Use ``_find_overloads`` to get the full
+        list when disambiguation matters.
 
-        # Second try: try prefixing the object with the module
-        # name.
+        Tier 4 collision fix: storage keys are now
+        ``name@objtype`` so a ``function Foo`` and a
+        ``procedure Foo`` do not collide. We look up the
+        (fullname, objtype) pair explicitly. If the explicit
+        lookup fails, fall back to a fullname-only search so
+        that legacy envs (keyed by fullname) still resolve.
+        """
+        # First try: explicit (name, objtype) lookup.
+        key = self._obj_key(name, objtype)
+        entries = self.objects.get(key)
+
+        # Second try: prefix with module name.
+        if entries is None and modname:
+            fqn = f"{modname}.{name}"
+            entries = self.objects.get(self._obj_key(fqn, objtype))
+            if entries is not None:
+                name = fqn
+
+        # Third try: legacy fullname-only lookup. Pre-Tier-4
+        # envs stored under bare fullname; we honour those
+        # so old pickled envs still work.
         if entries is None:
+            entries = self.objects.get(name)
+        if entries is None and modname:
             fqn = f"{modname}.{name}"
             entries = self.objects.get(fqn)
             if entries is not None:
@@ -1301,7 +1535,7 @@ class AdaDomain(Domain):
         return ("", "")
 
     def _find_overloads(
-        self, env: BuildEnvironment, modname: str, name: str
+        self, env: BuildEnvironment, modname: str, name: str, objtype: str = ""
     ) -> List[Tuple[str, str, str]]:
         """
         Return all overloads matching ``name`` (or
@@ -1311,22 +1545,49 @@ class AdaDomain(Domain):
         Returns an empty list when nothing matches.
 
         Tier 3a: this is the disambiguation entry point for
-        the overload-aware cross-reference resolver. The
-        overload summary directive uses it to render a
-        ``:ada:func:`Foo`` page that lists every overload and
-        links to it.
+        the overload-aware cross-reference resolver.
+
+        Tier 4: if ``objtype`` is supplied, search only that
+        slot (``name@objtype``). If empty, search every slot
+        that has ``name`` (with any objtype) so callers can
+        find function/procedure/etc. overloads together.
         """
         results: List[Tuple[str, str, str]] = []
-        for fqn in (name, f"{modname}.{name}"):
-            entries = self.objects.get(fqn)
-            if entries is None:
-                continue
-            # Accept both list (current) and single ObjectEntry
-            # (legacy pickled env).
-            if not isinstance(entries, list):
-                entries = [entries]
-            for entry in entries:
-                results.append((fqn, entry.docname, entry.objtype))
+        seen_keys: set = set()
+        candidate_fqns = [name]
+        if modname:
+            candidate_fqns.append(f"{modname}.{name}")
+        if objtype:
+            for fqn in candidate_fqns:
+                key = self._obj_key(fqn, objtype)
+                entries = self.objects.get(key)
+                if entries is None:
+                    continue
+                if not isinstance(entries, list):
+                    entries = [entries]
+                for entry in entries:
+                    results.append((fqn, entry.docname, entry.objtype))
+                    seen_keys.add(key)
+        else:
+            # Search every objtype slot for this name.
+            for key, entries in self.objects.items():
+                if not isinstance(entries, list):
+                    entries = [entries]
+                if not entries:
+                    continue
+                # Keys are ``name@objtype``. Strip the objtype.
+                if "@" not in key:
+                    # Legacy unkeyed entry (pre-Tier-4 env).
+                    if key in candidate_fqns:
+                        for entry in entries:
+                            results.append((key, entry.docname, entry.objtype))
+                    continue
+                key_name, key_objtype = key.rsplit("@", 1)
+                if key_name in candidate_fqns:
+                    for entry in entries:
+                        results.append(
+                            (key_name, entry.docname, entry.objtype)
+                        )
         return results
 
     def resolve_xref(
@@ -1420,17 +1681,25 @@ class AdaDomain(Domain):
         return results
 
     def get_objects(self) -> Iterator[Tuple[str, str, str, str, str, int]]:
-        # Tier 3a: ``self.objects[name]`` is now a list of
+        # Tier 3a: each ``self.objects[key]`` is a list of
         # ObjectEntry. We yield one inventory entry per
         # overload so all overloads are reachable from
         # intersphinx consumers. The ``refname`` is qualified
         # with the node_id when there are multiple overloads
-        # so inventory consumers can disambiguate. Without the
-        # suffix, two overloads of ``Foo`` would collide in
-        # the inventory.
-        for refname, entries in self.objects.items():
+        # so inventory consumers can disambiguate.
+        #
+        # Tier 4: storage keys are ``name@objtype``; we
+        # strip the objtype back off for the inventory's
+        # ``refname`` so intersphinx consumers see the real
+        # Ada fullname without the artificial join.
+        for key, entries in self.objects.items():
             if not isinstance(entries, list):
                 entries = [entries]
+            if "@" in key:
+                refname = key.rsplit("@", 1)[0]
+            else:
+                # Legacy unkeyed entry (pre-Tier-4 env).
+                refname = key
             for idx, obj in enumerate(entries):
                 if len(entries) > 1:
                     qualified = f"{refname}#{obj.node_id}"
@@ -1458,31 +1727,54 @@ class AdaDomain(Domain):
             "objects", {}
         )  # fullname -> list[ObjectEntry] | ObjectEntry
 
+    def _obj_key(self, name: str, objtype: str) -> str:
+        """
+        Compose the storage key for ``self.objects``.
+
+        Tier 4 collision fix: a ``function Foo`` and a
+        ``procedure Foo`` (both with fullname ``Pkg.Foo``) are
+        distinct Ada entities that must not collide in the
+        object store. The upstream implementation keyed by
+        fullname alone, which silently dropped one of the two
+        (last-write-wins). We now key by ``fullname@objtype``
+        so function/procedure collisions resolve cleanly.
+
+        ``@`` is chosen because it is illegal in Ada
+        identifiers (so no real fullname can contain it),
+        making the join unambiguous.
+        """
+        return f"{name}@{objtype}"
+
     def note_object(
         self, name: str, objtype: str, node_id: str, location: Any = None
     ) -> None:
         """
         Note an ada object for cross references.
 
-        Tier 3a: when a name is overloaded (e.g. two
-        ``Foo`` functions with different parameter lists), the
-        upstream implementation warns and overwrites; the
-        second overload becomes unreachable via
+        Tier 3a (overloads): when a name is overloaded (e.g.
+        two ``Foo`` functions with different parameter lists),
+        the upstream implementation warns and overwrites;
+        the second overload becomes unreachable via
         ``:ada:func:`Foo```. We instead keep a list of all
-        overloads under the same name. ``_find_obj`` returns
-        the first overload; ``_find_overloads`` returns the
-        full list for callers that need to disambiguate.
+        overloads under the same (name, objtype) key.
 
-        ``self.objects`` now maps fullname -> list of
-        ObjectEntry. Older callers that indexed
-        ``self.objects[name]`` expecting an ObjectEntry
-        directly have been updated to take ``[0]`` of the
-        list.
+        Tier 4 (collision fix): the storage key is
+        ``name@objtype`` so that ``function Foo`` and
+        ``procedure Foo`` in the same package get separate
+        entries. Previously they collided on fullname and one
+        was lost.
+
+        ``self.objects`` now maps ``name@objtype`` -> list of
+        ObjectEntry. The ``_obj_key`` helper composes the key
+        from a fullname and objtype pair. ``_find_obj`` and
+        ``_find_overloads`` accept the objtype explicitly so
+        the right slot is consulted.
         """
+        key = self._obj_key(name, objtype)
         new_entry = ObjectEntry(self.env.docname, node_id, objtype)
-        existing = self.objects.get(name)
+        existing = self.objects.get(key)
         if existing is None:
-            self.objects[name] = [new_entry]
+            self.objects[key] = [new_entry]
             return
         # Defensive: accept either a list (current) or a
         # single ObjectEntry (legacy pickled env from before
@@ -1498,7 +1790,7 @@ class AdaDomain(Domain):
                 name,
                 existing.docname,
             )
-            self.objects[name] = [existing, new_entry]
+            self.objects[key] = [existing, new_entry]
 
     @staticmethod
     def add_missing_reference(

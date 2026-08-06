@@ -1832,25 +1832,59 @@ class GenerateDoc(lal.App):
                 subp_kind = 'entry'
             else:
                 prof = make_profile(subp_spec)
-                subp_kind = (
-                    'procedure' if subp_spec.p_returns is None
-                    else 'function'
+                # Tier 4: ``NullSubpDecl`` (``procedure Foo is
+                # null;``) gets its own objtype so that
+                # cross-references can distinguish null bodies
+                # from real ones. ``make_profile`` only
+                # consumes the spec (``procedure Name (params)
+                # return T``), not the body (``is null``), so
+                # we append the body trailer explicitly for
+                # null subprograms. The ``handle_null_subp_sig``
+                # regex then matches the full sig.
+                if isinstance(decl, lal.NullSubpDecl):
+                    subp_kind = 'null_subprogram'
+                    prof = prof.rstrip() + ' is null'
+                else:
+                    subp_kind = (
+                        'procedure' if subp_spec.p_returns is None
+                        else 'function'
+                    )
+            # Tier 4.3: ``SubpRenamingDecl`` (``function Foo
+            # renames Real;``) gets its own objtype. The
+            # renamed target is a separate cross-reference
+            # target so readers can click through to the
+            # original entity. We emit a dedicated
+            # ``ada:subp_renaming::`` directive instead of
+            # the regular ``ada:function::`` /
+            # ``ada:procedure::`` shape.
+            if isinstance(decl, lal.SubpRenamingDecl):
+                target = strip_ws(
+                    decl.f_renames.text
+                ).removeprefix('renames').strip()
+                # ``p_subp_spec_or_null().p_returns`` is None
+                # for both procedure renames AND function
+                # renames (libadalang treats the renamed
+                # subprogram as opaque), so we look at the
+                # raw text of the original decl to determine
+                # the kind keyword.
+                decl_text = strip_ws(decl.text)
+                if decl_text.startswith('function'):
+                    kind_kw = 'function '
+                else:
+                    kind_kw = 'procedure '
+                prof = (
+                    f"{kind_kw}{decl.p_defining_name.text}"
+                    f" renames {target}"
                 )
+                subp_kind = 'subp_renaming'
             emit_directive(f".. ada:{subp_kind}:: {prof}")
 
             # If this is a ``NullSubpDecl`` (e.g.
-            # ``procedure Reset is null;``), emit an
-            # ``:is_null:`` body field so the reader knows the
-            # body is intentionally empty. Without this tag,
-            # the rendered page would look like a normal
-            # subprogram declaration with no body at all,
-            # which is misleading: a null body is a deliberate
-            # design choice (e.g. visitor pattern, abstract
-            # base class, dispatch table stub) and the reader
-            # needs to know.
-            if isinstance(decl, lal.NullSubpDecl):
-                self.add_lines([''])
-                self.add_string(':is_null: ``True``')
+            # ``procedure Reset is null;``), the objtype
+            # already says ``null_subprogram``. We used to
+            # also emit a ``:is_null:`` body field here for
+            # the ``procedure`` / ``function`` path; that is
+            # now redundant with the dedicated objtype.
 
             # If this is a ``SubpRenamingDecl`` (e.g.
             # ``function Aliased renames Real_Impl;``), emit
@@ -1916,6 +1950,17 @@ class GenerateDoc(lal.App):
 
         elif isinstance(decl, lal.BaseTypeDecl):
             if isinstance(decl, lal.IncompleteTypeDecl):
+                # Tier 4.4: ``type Foo;`` is a forward
+                # declaration. Previously we silently skipped
+                # it. We now emit ``ada:incomplete_type::``
+                # so the forward declaration becomes its own
+                # cross-reference target. The full type
+                # declaration later in the same package is
+                # emitted as ``ada:type::`` as before.
+                emit_directive(
+                    f".. ada:incomplete_type:: "
+                    f"{decl.p_relative_name.text}"
+                )
                 return
 
             # ProtectedTypeDecl is a BaseTypeDecl, but the
@@ -2113,10 +2158,15 @@ class GenerateDoc(lal.App):
         elif isinstance(decl, lal.PackageRenamingDecl):
             name = decl.p_defining_name.text
             renames = decl.p_renamed_package.p_defining_name.text
-            emit_directive(f".. ada:package:: {name}")
-            with self.indent():
-                self.add_lines([''])
-                self.add_string(f":renames: {renames}")
+            # Tier 4.3: emit ``ada:package_renaming::`` so the
+            # rename becomes a first-class objtype with its own
+            # cross-reference target, distinct from regular
+            # ``ada:package::`` declarations. Without this,
+            # the rename alias collides on fullname with the
+            # original ``ada:package`` target.
+            emit_directive(
+                f".. ada:package_renaming:: {name} renames {renames}"
+            )
 
         elif isinstance(decl, lal.ExceptionDecl):
             name = decl.p_defining_name.text
